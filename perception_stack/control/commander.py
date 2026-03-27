@@ -1,0 +1,97 @@
+"""
+PSU Eco Racing — Perception Stack
+control/commander.py  |  High-level command decision layer.
+
+Takes a PerceptionResult every frame and decides what to tell the
+low-level controller:
+
+    BRAKE    — obstacle detected within BRAKE_DIST_M
+    THROTTLE — lane visible, no close obstacle
+    IDLE     — lane completely lost (source == LOST or NO_FLOOR)
+
+The commander owns a UARTController and handles open/close.
+"""
+
+import logging
+
+from perception_stack.config  import (
+    BRAKE_DIST_M, UART_ENABLED,
+    THROTTLE_VALUE, BRAKE_VALUE,
+)
+from perception_stack.models  import PerceptionResult
+from perception_stack.control.uart import UARTController, CMD_IDLE, CMD_THROTTLE, CMD_BRAKE
+
+log = logging.getLogger(__name__)
+
+
+class Commander:
+    """
+    Usage (in main loop):
+        cmd = Commander()
+        cmd.open()
+        ...
+        cmd.update(result)      # call every frame
+        ...
+        cmd.close()
+    """
+
+    def __init__(self):
+        self.uart   = UARTController()
+        self._state = "INIT"    # last commanded state for logging
+
+    # ── Lifecycle ───────────────────────────────────────────────────────────────
+
+    def open(self) -> bool:
+        if not UART_ENABLED:
+            log.info("[Commander] UART disabled — dry-run mode")
+            return True
+        ok = self.uart.open()
+        if ok:
+            self.uart.idle()    # start in safe state
+        return ok
+
+    def close(self):
+        self.uart.close()
+
+    # ── Decision ────────────────────────────────────────────────────────────────
+
+    def update(self, result: PerceptionResult) -> str:
+        """
+        Evaluate result and send the appropriate UART command.
+        Returns the command name string ("THROTTLE" / "BRAKE" / "IDLE").
+        """
+        state = self._decide(result)
+
+        if UART_ENABLED:
+            if state == "BRAKE":
+                self.uart.brake(BRAKE_VALUE)
+            elif state == "THROTTLE":
+                self.uart.throttle(THROTTLE_VALUE)
+            else:
+                self.uart.idle()
+
+        if state != self._state:
+            log.info(
+                "[Commander] %s → %s  (obs=%.2fm  src=%s)",
+                self._state, state,
+                result.obstacle_dist_m if result.obstacle_detected else -1.0,
+                result.source,
+            )
+            self._state = state
+
+        return state
+
+    # ── Internal ────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _decide(result: PerceptionResult) -> str:
+        # 1. Obstacle inside brake zone — hard stop regardless of lane state
+        if result.obstacle_detected and result.obstacle_dist_m <= BRAKE_DIST_M:
+            return "BRAKE"
+
+        # 2. No usable lane info — coast / hold
+        if result.source in ("LOST", "NO_FLOOR"):
+            return "IDLE"
+
+        # 3. Lane visible, no close obstacle — go
+        return "THROTTLE"

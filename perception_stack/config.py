@@ -92,5 +92,17 @@ WARP_SRC = np.float32([[0.40, 0.55], [0.60, 0.55],
 WARP_DST = np.float32([[0.20, 0.05], [0.80, 0.05],
                         [0.80, 0.95], [0.20, 0.95]])
 
+# ── UART / low-level controller ────────────────────────────────────────────────
+UART_ENABLED       = True           # set False for vision-only testing (dry run)
+UART_PORT          = "/dev/ttyTHS1" # Jetson hardware UART; change to /dev/ttyUSB0 etc.
+UART_BAUD          = 115200
+UART_TIMEOUT_S     = 0.01           # serial read timeout (s)
+UART_ACK_TIMEOUT_S = 0.05           # how long to wait for MCU echo (s)
+
+# ── Vehicle commands ────────────────────────────────────────────────────────────
+BRAKE_DIST_M    = 1.5   # m — obstacle closer than this triggers BRAKE
+THROTTLE_VALUE  = 200   # 0-255 sent with THROTTLE frame
+BRAKE_VALUE     = 255   # 0-255 sent with BRAKE frame
+
 # ── Display ────────────────────────────────────────────────────────────────────
 DISPLAY = True
