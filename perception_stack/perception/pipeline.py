@@ -23,6 +23,7 @@ from perception_stack.config import (
     STOP_VOTE_NEEDED,
     OBS_MIN_DIST_M, OBS_MAX_DIST_M, OBS_SDK_ENABLE,
     WARP_ENABLED,
+    SIGN_VOTE_NEEDED,
 )
 from perception_stack.models import PerceptionResult
 from perception_stack.lane.fitting import fit_lanes
@@ -31,6 +32,7 @@ from perception_stack.lane.memory import LaneMemory
 from perception_stack.lane.deviation import compute_deviation
 from perception_stack.detection.stop_line import detect_stop_line
 from perception_stack.detection.obstacle import detect_obstacle_pc
+from perception_stack.detection.stop_sign import detect_stop_sign
 from perception_stack.perception.warp import WarpTransform
 
 
@@ -75,6 +77,11 @@ class LanePerception:
         self._stop_votes:     int           = 0
         self._last_stop_dist: float         = 0.0
         self._last_stop_y:    Optional[int] = None
+
+        # Stop-sign temporal vote gate
+        self._sign_votes:     int                        = 0
+        self._last_sign_dist: float                      = 0.0
+        self._last_sign_bbox: Optional[tuple]            = None
 
     # ── Init ───────────────────────────────────────────────────────────────────
 
@@ -342,6 +349,22 @@ class LanePerception:
                         x1, y1 = pts[:, 0].max(), pts[:, 1].max()
                         obs_bbox = (int(x0), int(y0), int(x1-x0), int(y1-y0))
 
+        # Stop-sign detection
+        raw_sign, raw_sign_dist, raw_sign_bbox = detect_stop_sign(
+            frame, pc, self.H, self.W)
+
+        MAX_SIGN_VOTES = SIGN_VOTE_NEEDED + 5
+        self._sign_votes = (min(MAX_SIGN_VOTES, self._sign_votes + 1) if raw_sign
+                            else max(0, self._sign_votes - 1))
+        if raw_sign and raw_sign_dist > 0:
+            self._last_sign_dist = raw_sign_dist
+        if raw_sign and raw_sign_bbox is not None:
+            self._last_sign_bbox = raw_sign_bbox
+
+        sign_confirmed = self._sign_votes >= SIGN_VOTE_NEEDED
+        out_sign_dist  = self._last_sign_dist if sign_confirmed else 0.0
+        out_sign_bbox  = self._last_sign_bbox if sign_confirmed else None
+
         return PerceptionResult(
             deviation_m        = dev,
             confidence         = min(0.99, (lc + rc) / 2.0),
@@ -360,6 +383,9 @@ class LanePerception:
             obstacle_dist_m    = obs_dist,
             obstacle_lateral_m = obs_lat,
             obstacle_bbox      = obs_bbox,
+            stop_sign          = sign_confirmed,
+            stop_sign_dist_m   = out_sign_dist,
+            stop_sign_bbox     = out_sign_bbox,
         ), frame, fm, wm, gm
 
     def close(self):

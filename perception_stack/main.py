@@ -21,8 +21,8 @@ def main():
 
     print("\nPerception v4 — press Q to quit\n")
     print(f"{'Frame':>6} | {'Source':>12} | {'Dev(m)':>8} | "
-          f"{'Width':>7} | {'Conf':>5} | {'Status':>7} | {'Cmd':>8} | Stop       | Obstacle")
-    print("-" * 107)
+          f"{'Width':>7} | {'Conf':>5} | {'Status':>7} | {'Cmd':>8} | Stop       | Sign       | Obstacle")
+    print("-" * 120)
 
     fc = 0
     try:
@@ -51,11 +51,13 @@ def main():
                 obs_str  = (f"OBS@{result.obstacle_dist_m:.1f}m "
                             f"lat{result.obstacle_lateral_m:+.2f}m"
                             if result.obstacle_detected else "-")
+                sign_str = (f"SIGN@{result.stop_sign_dist_m:.1f}m"
+                            if result.stop_sign else "-")
                 print(f"{fc:>6} | {result.source:>12} | "
                       f"{result.deviation_m:>+8.3f} | "
                       f"{result.lane_width_m:>7.2f} | "
                       f"{result.confidence:>5.0%} | "
-                      f"{cs:>7} | {control_cmd:>8} | {stop_str:<10} | {obs_str}")
+                      f"{cs:>7} | {control_cmd:>8} | {stop_str:<10} | {sign_str:<10} | {obs_str}")
 
     finally:
         cmd.close()

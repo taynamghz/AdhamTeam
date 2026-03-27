@@ -28,3 +28,7 @@ class PerceptionResult:
     obstacle_dist_m:    float = 0.0
     obstacle_lateral_m: float = 0.0
     obstacle_bbox:      Optional[Tuple[int,int,int,int]] = None  # (x,y,w,h) px
+    # Stop sign
+    stop_sign:          bool  = False
+    stop_sign_dist_m:   float = 0.0
+    stop_sign_bbox:     Optional[Tuple[int,int,int,int]] = None  # (x,y,w,h) px

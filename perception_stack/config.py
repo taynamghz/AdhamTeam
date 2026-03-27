@@ -82,6 +82,25 @@ OBS_LANE_MARGIN_M  = 0.40    # lateral margin beyond lane edges still counts
 OBS_MIN_CLUSTER_PX = 60      # minimum point-cloud points per blob (noise rejection)
 OBS_SDK_ENABLE     = True    # enable ZED object detection (people / vehicles)
 
+# ── Stop-sign detection ────────────────────────────────────────────────────────
+# Red HSV ranges (hue wraps: 0-H_LOW_MAX and H_HIGH_MIN-180)
+SIGN_RED_H_LOW_MAX   = 10      # upper bound of low-red hue band
+SIGN_RED_H_HIGH_MIN  = 160     # lower bound of high-red hue band
+SIGN_RED_S_MIN       = 120     # minimum saturation — reject pale/pink
+SIGN_RED_V_MIN       = 60      # minimum value — reject very dark red
+# Contour / shape filters
+SIGN_MIN_AREA_PX     = 800     # ignore tiny blobs (far-away / noise)
+SIGN_MAX_AREA_PX     = 80_000  # ignore blobs that fill most of the frame
+SIGN_POLY_SIDES_MIN  = 6       # octagon seen at distance may appear 6-sided
+SIGN_POLY_SIDES_MAX  = 10      # allow some detection slop
+SIGN_ASPECT_MIN      = 0.5     # bounding-rect W/H — rejects thin red banners
+SIGN_ASPECT_MAX      = 1.8
+# Distance gate
+SIGN_DIST_MIN_M      = 0.5
+SIGN_DIST_MAX_M      = 15.0
+# Temporal vote gate (frames) — avoids single-frame false positives
+SIGN_VOTE_NEEDED     = 3
+
 # ── Bird's-eye warp ────────────────────────────────────────────────────────────
 # Set WARP_ENABLED=True once you have measured SRC corners on your track.
 # SRC = road trapezoid in camera image (fractions of W, H).
