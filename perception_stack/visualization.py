@@ -119,6 +119,16 @@ def draw(frame: np.ndarray, result: PerceptionResult,
         cv2.putText(vis, obs_label, (ox, max(oy - 8, 12)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
+    # Lookahead point marker
+    if result.lookahead_pixel is not None:
+        lx_pt, ly_pt = result.lookahead_pixel
+        cv2.circle(vis, (lx_pt, ly_pt), 10, (0, 255, 255), -1)
+        cv2.circle(vis, (lx_pt, ly_pt), 13, (255, 255, 0),  2)
+        if result.lookahead_point is not None:
+            z_m = result.lookahead_point[1]
+            cv2.putText(vis, f"{z_m:.1f}m", (lx_pt + 16, ly_pt + 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
+
     # HUD
     sc = {"WHITE_LINE": (0,255,0), "GRASS": (0,200,0),
           "LOST": (0,0,255), "NO_FLOOR": (0,0,255)}.get(result.source, (180,180,180))
@@ -127,7 +137,7 @@ def draw(frame: np.ndarray, result: PerceptionResult,
     cs = ("CENTER" if abs(result.deviation_m) < thresh
           else "LEFT" if result.deviation_m > 0 else "RIGHT")
 
-    cv2.rectangle(vis, (0, 0), (W, 138), (0,0,0), -1)
+    cv2.rectangle(vis, (0, 0), (W, 162), (0,0,0), -1)
     cv2.putText(vis,
         f"Source:{result.source}{virt_tag}  Conf:{result.confidence:.0%}  "
         f"Width:{result.lane_width_m:.2f}m",
@@ -149,4 +159,12 @@ def draw(frame: np.ndarray, result: PerceptionResult,
                  if result.stop_sign else "No stop sign")
     cv2.putText(vis, sign_info, (10, 133), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
                 (0, 0, 200) if result.stop_sign else (80, 80, 80), 2)
+    # Control outputs row
+    lhd_str = (f"  LA:{result.lookahead_point[1]:.1f}m"
+               if result.lookahead_point is not None else "  LA:--")
+    ctrl_col = (0, 200, 255)
+    cv2.putText(vis,
+        f"Head:{np.degrees(result.heading_angle):+.1f}deg  "
+        f"Curv:{result.curvature:+.3f}m⁻¹{lhd_str}",
+        (10, 157), cv2.FONT_HERSHEY_SIMPLEX, 0.6, ctrl_col, 2)
     return vis

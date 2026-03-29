@@ -63,8 +63,15 @@ PRIOR_MARGIN = 50               # px band around previous polynomial
 SMOOTH_ALPHA = 0.30             # lower = smoother, higher = more responsive
 
 # ── Lane geometry sanity ───────────────────────────────────────────────────────
-LANE_WIDTH_MIN = 0.20
-LANE_WIDTH_MAX = 12.0
+LANE_WIDTH_MIN   = 0.20
+LANE_WIDTH_MAX   = 12.0
+# Absolute pixel floor for lf/rf separation (protects the first frames before
+# lane memory has built up — prevents degenerate same-feature fits).
+MIN_LANE_SEP_PX  = 40
+# Memory-relative width gate: if the raw fit separation is less than this
+# fraction of the remembered lane width, one fit is contaminated (e.g. by an
+# obstacle edge).  The drifting fit is discarded; lane memory fills the gap.
+LANE_SEP_MEM_FRAC = 0.70
 
 # ── Lane memory (virtual boundary on single-side turns) ────────────────────────
 LANE_MEM_MAX = 60               # rolling history length (frames × 5 samples)
@@ -80,7 +87,7 @@ OBS_MIN_DIST_M     = 0.30    # closest distance to report
 OBS_MAX_DIST_M     = 4.00    # furthest distance to report
 OBS_LANE_MARGIN_M  = 0.40    # lateral margin beyond lane edges still counts
 OBS_MIN_CLUSTER_PX = 60      # minimum point-cloud points per blob (noise rejection)
-OBS_SDK_ENABLE     = True    # enable ZED object detection (people / vehicles)
+OBS_SDK_ENABLE     = False   # enable ZED object detection (people / vehicles)
 
 # ── Stop-sign detection ────────────────────────────────────────────────────────
 # Red HSV ranges (hue wraps: 0-H_LOW_MAX and H_HIGH_MIN-180)
@@ -119,9 +126,20 @@ UART_TIMEOUT_S     = 0.01           # serial read timeout (s)
 UART_ACK_TIMEOUT_S = 0.05           # how long to wait for MCU echo (s)
 
 # ── Vehicle commands ────────────────────────────────────────────────────────────
-BRAKE_DIST_M    = 1.5   # m — obstacle closer than this triggers BRAKE
-THROTTLE_VALUE  = 200   # 0-255 sent with THROTTLE frame
-BRAKE_VALUE     = 255   # 0-255 sent with BRAKE frame
+BRAKE_DIST_M       = 1.5   # m — obstacle closer than this triggers BRAKE
+STOP_BRAKE_DIST_M  = 1.0   # m — stop line/sign must be within this to trigger BRAKE
+THROTTLE_VALUE     = 20    # 0-255 sent with THROTTLE frame
+BRAKE_VALUE        = 255   # 0-255 sent with BRAKE frame
+
+# ── Control outputs ────────────────────────────────────────────────────────────
+# Lookahead distance for Pure Pursuit / PID feed-forward (metres)
+CTRL_LOOKAHEAD_M     = 2.5
+# EMA alpha for heading angle smoothing (lower = smoother, higher = responsive)
+CTRL_HEADING_ALPHA   = 0.20
+# EMA alpha for curvature (extra-smooth — small errors get amplified in κ)
+CTRL_CURVATURE_ALPHA = 0.15
+# Image-row fraction used to evaluate heading & curvature (0=top, 1=bottom)
+CTRL_EVAL_Y_FRAC     = 0.60
 
 # ── Display ────────────────────────────────────────────────────────────────────
 DISPLAY = True

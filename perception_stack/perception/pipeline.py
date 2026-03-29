@@ -24,9 +24,12 @@ from perception_stack.config import (
     OBS_MIN_DIST_M, OBS_MAX_DIST_M, OBS_SDK_ENABLE,
     WARP_ENABLED,
     SIGN_VOTE_NEEDED,
+    CTRL_EVAL_Y_FRAC,
+    MIN_LANE_SEP_PX,
+    LANE_SEP_MEM_FRAC,
 )
 from perception_stack.models import PerceptionResult
-from perception_stack.lane.fitting import fit_lanes
+from perception_stack.lane.fitting import fit_lanes, eval_x
 from perception_stack.lane.smoother import Smoother
 from perception_stack.lane.memory import LaneMemory
 from perception_stack.lane.deviation import compute_deviation
@@ -34,6 +37,9 @@ from perception_stack.detection.stop_line import detect_stop_line
 from perception_stack.detection.obstacle import detect_obstacle_pc
 from perception_stack.detection.stop_sign import detect_stop_sign
 from perception_stack.perception.warp import WarpTransform
+from perception_stack.lane.control import (
+    compute_heading, compute_curvature, compute_lookahead, ControlSmoother,
+)
 
 
 class LanePerception:
@@ -42,8 +48,9 @@ class LanePerception:
         self.cam       = sl.Camera()
         self.floor_y   = None
         self.frame_cnt = 0
-        self.smoother  = Smoother()
-        self.warp      = WarpTransform()
+        self.smoother      = Smoother()
+        self.ctrl_smoother = ControlSmoother()
+        self.warp          = WarpTransform()
 
         # Smoothed image-space fits used as priors
         self._prev_lf: Optional[np.ndarray] = None
@@ -67,8 +74,12 @@ class LanePerception:
         # Floor tracking state
         self._floor_miss_count: int = 0
 
-        # Hold-last deviation for LOST state
+        # Hold-last values for LOST / degenerate state
         self._last_deviation: float = 0.0
+        self._last_heading:   float = 0.0
+        self._last_curvature: float = 0.0
+        # Previous-frame obstacle bbox used to mask lane fitting masks
+        self._prev_obs_bbox: Optional[Tuple[int, int, int, int]] = None
 
         # Lane memory
         self.lane_mem = LaneMemory()
@@ -250,6 +261,16 @@ class LanePerception:
         fm               = self._floor_mask(pc)
         wm, gm, hls, hsv = self._color_masks(frame, fm)
 
+        # Blank the previous frame's obstacle region so the fitter cannot latch
+        # onto obstacle edges/markings instead of lane lines.
+        if self._prev_obs_bbox is not None:
+            ox, oy, ow, oh = self._prev_obs_bbox
+            pad = 15
+            y0, y1 = max(0, oy - pad), min(self.H, oy + oh + pad)
+            x0, x1 = max(0, ox - pad), min(self.W, ox + ow + pad)
+            wm[y0:y1, x0:x1] = 0
+            gm[y0:y1, x0:x1] = 0
+
         # Level 1: white lines (primary)
         wl, wr, wlc, wrc = self._fit_mask(wm)
 
@@ -267,6 +288,40 @@ class LanePerception:
 
         raw_l, lc = best([(wl, wlc * 1.4), (gl, glc)])
         raw_r, rc = best([(wr, wrc * 1.4), (gr, grc)])
+
+        # Fit contamination guard — applied to RAW fits BEFORE the EMA smoother
+        # so the smoother never absorbs obstacle-edge detections.
+        #
+        # Gate 1 (absolute): protects early frames before memory is built.
+        # Gate 2 (relative): main guard — if sep < 70% of remembered width,
+        #   one fit is contaminated (e.g. obstacle narrowing apparent lane).
+        #   The fit that deviated most from its expected position is discarded;
+        #   lane memory immediately reconstructs the missing virtual boundary.
+        if raw_l is not None and raw_r is not None:
+            y_g = int(self.H * 0.85)
+            sep = eval_x(raw_r, y_g) - eval_x(raw_l, y_g)
+            too_close = sep < MIN_LANE_SEP_PX
+            if not too_close and self.lane_mem.mean_px is not None:
+                too_close = sep < LANE_SEP_MEM_FRAC * self.lane_mem.mean_px
+            if too_close:
+                lx = eval_x(raw_l, y_g)
+                rx = eval_x(raw_r, y_g)
+                if self.lane_mem.mean_px is not None:
+                    # Discard whichever fit strayed furthest from expected pos
+                    r_err = abs(rx - (lx + self.lane_mem.mean_px))
+                    l_err = abs(lx - (rx - self.lane_mem.mean_px))
+                    if r_err >= l_err:
+                        raw_r, rc = None, 0.0
+                        self.smoother.r_ema = None   # flush contaminated EMA
+                    else:
+                        raw_l, lc = None, 0.0
+                        self.smoother.l_ema = None   # flush contaminated EMA
+                elif lc >= rc:
+                    raw_r, rc = None, 0.0
+                    self.smoother.r_ema = None
+                else:
+                    raw_l, lc = None, 0.0
+                    self.smoother.l_ema = None
 
         if raw_l is not None: self._prev_lf = raw_l
         if raw_r is not None: self._prev_rf = raw_r
@@ -365,6 +420,33 @@ class LanePerception:
         out_sign_dist  = self._last_sign_dist if sign_confirmed else 0.0
         out_sign_bbox  = self._last_sign_bbox if sign_confirmed else None
 
+        # Persist obstacle bbox for next-frame mask exclusion
+        self._prev_obs_bbox = obs_bbox if obs_det else None
+
+        # ── Control outputs ────────────────────────────────────────────────────
+        # Evaluation row: fraction of image height ahead of vehicle
+        y_ctrl = int(self.H * CTRL_EVAL_Y_FRAC)
+
+        # Pixel lane width at the evaluation row (for curvature metric scaling)
+        wid_px = 0.0
+        if lf is not None and rf is not None:
+            wid_px = abs(eval_x(rf, y_ctrl) - eval_x(lf, y_ctrl))
+
+        # Only update the control smoother when we have a geometrically valid
+        # lane (non-degenerate, positive width).  Otherwise hold the last good
+        # heading/curvature so the controller keeps the previous steering intent.
+        have_valid_lane = (lf is not None or rf is not None) and wid > 0.0
+        if have_valid_lane:
+            heading_raw = compute_heading(lf, rf, y_ctrl)
+            curv_raw    = compute_curvature(lf, rf, y_ctrl, wid_px, wid)
+            h_sm, k_sm  = self.ctrl_smoother.update(heading_raw, curv_raw)
+            self._last_heading   = h_sm
+            self._last_curvature = k_sm
+        heading_sm = self._last_heading
+        curv_sm    = self._last_curvature
+
+        lookahead_world, lookahead_px = compute_lookahead(lf, rf, pc, self.H, self.W)
+
         return PerceptionResult(
             deviation_m        = dev,
             confidence         = min(0.99, (lc + rc) / 2.0),
@@ -386,6 +468,10 @@ class LanePerception:
             stop_sign          = sign_confirmed,
             stop_sign_dist_m   = out_sign_dist,
             stop_sign_bbox     = out_sign_bbox,
+            heading_angle      = heading_sm,
+            curvature          = curv_sm,
+            lookahead_point    = lookahead_world,
+            lookahead_pixel    = lookahead_px,
         ), frame, fm, wm, gm
 
     def close(self):

@@ -32,3 +32,8 @@ class PerceptionResult:
     stop_sign:          bool  = False
     stop_sign_dist_m:   float = 0.0
     stop_sign_bbox:     Optional[Tuple[int,int,int,int]] = None  # (x,y,w,h) px
+    # Control outputs (for Pure Pursuit / PID downstream)
+    heading_angle:      float = 0.0                              # radians; θ = arctan(2ay+b)
+    curvature:          float = 0.0                              # κ = 1/R  (m⁻¹); signed
+    lookahead_point:    Optional[Tuple[float,float]] = None      # (X_m, Z_m) world space
+    lookahead_pixel:    Optional[Tuple[int,int]]     = None      # (x, y) image pixels

@@ -17,6 +17,7 @@ import logging
 from perception_stack.config  import (
     BRAKE_DIST_M, UART_ENABLED,
     THROTTLE_VALUE, BRAKE_VALUE,
+    STOP_BRAKE_DIST_M,
 )
 from perception_stack.models  import PerceptionResult
 from perception_stack.control.uart import UARTController, CMD_IDLE, CMD_THROTTLE, CMD_BRAKE
@@ -89,9 +90,13 @@ class Commander:
         if result.obstacle_detected and result.obstacle_dist_m <= BRAKE_DIST_M:
             return "BRAKE"
 
-        # 2. No usable lane info — coast / hold
-        if result.source in ("LOST", "NO_FLOOR"):
-            return "IDLE"
+        # 2. Stop line confirmed and within brake distance
+        if result.stop_line and 0 < result.stop_line_dist <= STOP_BRAKE_DIST_M:
+            return "BRAKE"
 
-        # 3. Lane visible, no close obstacle — go
+        # 3. Stop sign confirmed and within brake distance
+        if result.stop_sign and 0 < result.stop_sign_dist_m <= STOP_BRAKE_DIST_M:
+            return "BRAKE"
+
+        # 4. No stop trigger — go forward regardless of lane state
         return "THROTTLE"

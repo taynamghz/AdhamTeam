@@ -2,12 +2,14 @@
 PSU Eco Racing — Perception Stack
 control/uart.py  |  UART transport layer to the low-level controller.
 
-Protocol — 4-byte binary frame (little-endian):
+Protocol — 5-byte binary frame (matches doc section 2.2):
     [0xAA]  start byte
+    [LEN ]  payload length = 2  (CMD + DATA)
     [CMD ]  command  0x00=IDLE  0x01=THROTTLE  0x02=BRAKE
-    [VAL ]  value    0–255  (throttle/brake intensity)
-    [CHK ]  checksum CMD ^ VAL
+    [DATA]  value    0–255  (throttle/brake intensity)
+    [CRC8]  CRC-8/SMBUS over [LEN, CMD, DATA]  (poly=0x07, init=0x00)
 
+Watchdog: Nucleo expects a valid packet every 200ms or it falls back to manual.
 The low-level MCU must echo the CMD byte back; if it doesn't arrive within
 UART_ACK_TIMEOUT_S seconds the send is logged as un-acknowledged (non-fatal).
 """
@@ -34,9 +36,25 @@ _CMD_NAME = {CMD_IDLE: "IDLE", CMD_THROTTLE: "THROTTLE", CMD_BRAKE: "BRAKE"}
 _START = 0xAA
 
 
+def _crc8(data: bytes) -> int:
+    """CRC-8/SMBUS: poly=0x07, init=0x00, no reflection."""
+    crc = 0x00
+    for byte in data:
+        crc ^= byte
+        for _ in range(8):
+            if crc & 0x80:
+                crc = (crc << 1) ^ 0x07
+            else:
+                crc <<= 1
+        crc &= 0xFF
+    return crc
+
+
 def _build_frame(cmd: int, value: int) -> bytes:
-    chk = (cmd ^ value) & 0xFF
-    return struct.pack("BBBB", _START, cmd & 0xFF, value & 0xFF, chk)
+    """Build 5-byte frame: [0xAA][LEN=2][CMD][DATA][CRC8]."""
+    payload = bytes([2, cmd & 0xFF, value & 0xFF])
+    crc = _crc8(payload)
+    return struct.pack("BBBBB", _START, payload[0], payload[1], payload[2], crc)
 
 
 class UARTController:
