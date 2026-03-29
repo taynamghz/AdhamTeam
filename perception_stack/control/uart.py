@@ -72,9 +72,11 @@ class UARTController:
     def __init__(self):
         self._ser:    serial.Serial | None = None
         self._lock    = threading.Lock()
-        self._last_cmd: int   = -1    # avoid repeat sends of the same command
-        self._last_val: int   = -1
         self.connected: bool  = False
+        # Speed telemetry from Nucleo — frame: [0xBB][int_part][frac_part][0xEE]
+        self._speed_kmh: float = -1.0   # -1.0 = not yet received
+        self._running:   bool  = False
+        self._reader_thread: threading.Thread | None = None
 
     # ── Lifecycle ───────────────────────────────────────────────────────────────
 
@@ -89,6 +91,10 @@ class UARTController:
                 timeout  = UART_TIMEOUT_S,
             )
             self.connected = True
+            self._running = True
+            self._reader_thread = threading.Thread(
+                target=self._reader_loop, daemon=True, name="uart-speed-rx")
+            self._reader_thread.start()
             log.info("[UART] Opened %s @ %d baud", UART_PORT, UART_BAUD)
             return True
         except serial.SerialException as e:
@@ -97,26 +103,61 @@ class UARTController:
             return False
 
     def close(self):
+        self._running = False
         if self._ser and self._ser.is_open:
             self.send(CMD_IDLE, 0)          # safe state before disconnect
             time.sleep(0.05)
             self._ser.close()
+        if self._reader_thread is not None:
+            self._reader_thread.join(timeout=1.0)
         self.connected = False
         log.info("[UART] Closed")
+
+    # ── Speed telemetry RX ──────────────────────────────────────────────────────
+
+    def _reader_loop(self) -> None:
+        """
+        Background thread: watches for Nucleo speed frames.
+        Frame format: [0xBB][int_part][frac_part × 100][0xEE]
+        e.g. 12.75 km/h → [0xBB][12][75][0xEE]
+        """
+        buf = bytearray()
+        while self._running:
+            if not (self._ser and self._ser.is_open):
+                time.sleep(0.05)
+                continue
+            try:
+                byte = self._ser.read(1)
+                if byte:
+                    buf.extend(byte)
+                    # Scan for a complete valid frame
+                    while len(buf) >= 4:
+                        if buf[0] == 0xBB and buf[3] == 0xEE:
+                            self._speed_kmh = buf[1] + buf[2] / 100.0
+                            log.debug("[UART] ← speed %.2f km/h", self._speed_kmh)
+                            buf = buf[4:]
+                        else:
+                            buf = buf[1:]   # slide: resync on next 0xBB
+            except serial.SerialException as e:
+                log.warning("[UART] RX error: %s", e)
+                time.sleep(0.01)
+
+    @property
+    def speed_kmh(self) -> float:
+        """Latest speed received from Nucleo in km/h. -1.0 if not yet received."""
+        return self._speed_kmh
 
     # ── Send ────────────────────────────────────────────────────────────────────
 
     def send(self, cmd: int, value: int = 0) -> bool:
         """
-        Transmit one command frame.  Skips duplicate (cmd, value) pairs to avoid
-        flooding the MCU with identical messages.  Returns True on success.
+        Transmit one command frame every call — no deduplication.
+        The Nucleo watchdog requires a valid packet at least every 200ms;
+        at 30fps we send every ~33ms so the watchdog stays fed.
+        Returns True on success.
         """
         if not self.connected or self._ser is None:
             return False
-
-        # De-duplicate
-        if cmd == self._last_cmd and value == self._last_val:
-            return True
 
         frame = _build_frame(cmd, value)
         with self._lock:
@@ -128,8 +169,6 @@ class UARTController:
                 self.connected = False
                 return False
 
-        self._last_cmd = cmd
-        self._last_val = value
         log.debug("[UART] → %s  val=%d", _CMD_NAME.get(cmd, f"0x{cmd:02X}"), value)
         return True
 

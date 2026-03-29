@@ -143,3 +143,13 @@ CTRL_EVAL_Y_FRAC     = 0.60
 
 # ── Display ────────────────────────────────────────────────────────────────────
 DISPLAY = True
+
+# ── Simple test mode ────────────────────────────────────────────────────────────
+# Disables lane fitting, obstacle detection, and grass detection.
+# Runs only stop-line + stop-sign detection — much faster for initial testing.
+SIMPLE_TEST_MODE = True
+
+# ── Camera depth mode ───────────────────────────────────────────────────────────
+# PERFORMANCE: fastest, sufficient for stop detection distances.
+# NEURAL: most accurate, use for full autonomy.
+CAM_DEPTH_MODE = sl.DEPTH_MODE.PERFORMANCE

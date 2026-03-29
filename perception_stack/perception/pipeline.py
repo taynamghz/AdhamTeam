@@ -14,7 +14,7 @@ import pyzed.sl as sl
 from typing import Optional, Tuple
 
 from perception_stack.config import (
-    CAM_RES, CAM_FPS,
+    CAM_RES, CAM_FPS, CAM_DEPTH_MODE,
     FLOOR_TOLERANCE, FLOOR_TOLERANCE_WIDE, FLOOR_STABLE_HZ, FLOOR_LOST_CONSEC,
     ROI_TOP_FRACTION, FLOOR_HIT_POINTS,
     WHITE_L_MIN, WHITE_S_MAX,
@@ -27,6 +27,7 @@ from perception_stack.config import (
     CTRL_EVAL_Y_FRAC,
     MIN_LANE_SEP_PX,
     LANE_SEP_MEM_FRAC,
+    SIMPLE_TEST_MODE,
 )
 from perception_stack.models import PerceptionResult
 from perception_stack.lane.fitting import fit_lanes, eval_x
@@ -104,7 +105,7 @@ class LanePerception:
         init = sl.InitParameters()
         init.camera_resolution = CAM_RES
         init.camera_fps        = CAM_FPS
-        init.depth_mode        = sl.DEPTH_MODE.NEURAL
+        init.depth_mode        = CAM_DEPTH_MODE
         init.coordinate_units  = sl.UNIT.METER
         init.coordinate_system = sl.COORDINATE_SYSTEM.RIGHT_HANDED_Y_UP
 
@@ -260,6 +261,44 @@ class LanePerception:
 
         fm               = self._floor_mask(pc)
         wm, gm, hls, hsv = self._color_masks(frame, fm)
+
+        # ── Simple test mode: stop-line + stop-sign only, skip all lane work ──
+        if SIMPLE_TEST_MODE:
+            raw_stop, raw_y, raw_dist = detect_stop_line(
+                frame, fm, None, None, pc, self.H, self.W, hls, hsv)
+            MAX_VOTES = STOP_VOTE_NEEDED + 5
+            self._stop_votes = (min(MAX_VOTES, self._stop_votes + 1) if raw_stop
+                                else max(0, self._stop_votes - 1))
+            if raw_stop and raw_dist > 0:
+                self._last_stop_dist = raw_dist
+            if raw_stop and raw_y is not None:
+                self._last_stop_y = raw_y
+            stop_confirmed = self._stop_votes >= STOP_VOTE_NEEDED
+            out_y    = self._last_stop_y    if stop_confirmed else None
+            out_dist = self._last_stop_dist if stop_confirmed else 0.0
+
+            raw_sign, raw_sign_dist, raw_sign_bbox = detect_stop_sign(
+                frame, pc, self.H, self.W)
+            MAX_SIGN_VOTES = SIGN_VOTE_NEEDED + 5
+            self._sign_votes = (min(MAX_SIGN_VOTES, self._sign_votes + 1) if raw_sign
+                                else max(0, self._sign_votes - 1))
+            if raw_sign and raw_sign_dist > 0:
+                self._last_sign_dist = raw_sign_dist
+            if raw_sign and raw_sign_bbox is not None:
+                self._last_sign_bbox = raw_sign_bbox
+            sign_confirmed = self._sign_votes >= SIGN_VOTE_NEEDED
+            out_sign_dist  = self._last_sign_dist if sign_confirmed else 0.0
+            out_sign_bbox  = self._last_sign_bbox if sign_confirmed else None
+
+            return PerceptionResult(
+                source           = "SIMPLE",
+                stop_line        = stop_confirmed,
+                stop_line_y      = out_y,
+                stop_line_dist   = out_dist,
+                stop_sign        = sign_confirmed,
+                stop_sign_dist_m = out_sign_dist,
+                stop_sign_bbox   = out_sign_bbox,
+            ), frame, fm, None, None
 
         # Blank the previous frame's obstacle region so the fitter cannot latch
         # onto obstacle edges/markings instead of lane lines.
