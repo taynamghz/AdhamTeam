@@ -1,119 +1,185 @@
 """
 PSU Eco Racing — Perception Stack
-detection/stop_sign.py  |  Red octagon stop-sign detector.
+detection/stop_sign.py  |  Threaded YOLOv8 stop-sign detector.
 
-Algorithm:
-  1. Build a red HSV mask (two hue bands — red wraps around 0/180 in HSV).
-  2. Find external contours on the mask.
-  3. For each large-enough contour:
-       a. Approximate polygon (Ramer–Douglas–Peucker).
-       b. Accept 6–10 sides (octagon looks 6-8 sided under perspective/distance).
-       c. Aspect-ratio check (bounding rect W/H must be 0.5–1.8).
-  4. Pick the largest qualifying contour.
-  5. Estimate distance from the ZED point cloud at the sign's centroid.
+Architecture:
+  - submit(frame, pc, H, W) — called by the main pipeline every frame.
+    Non-blocking: posts the latest frame to a maxsize-1 queue and returns
+    immediately.  Stale frames are dropped so the worker always processes fresh.
+  - get_result() — returns the latest confirmed (detected, dist_m, bbox).
+    Non-blocking read; safe to call every frame from the main thread.
 
-Returns (detected, dist_m, bbox_px) where bbox_px = (x, y, w, h).
+The worker thread:
+  1. Pulls the latest frame from the queue.
+  2. Runs YOLO inference every SIGN_SKIP_FRAMES frames (skips between runs to
+     keep GPU load in budget; cached result carries through skipped frames).
+  3. Applies distance gate via ZED point cloud.
+  4. Runs the temporal vote gate (SIGN_VOTE_NEEDED consecutive detections).
+  5. Writes confirmed result to _result under a lock.
+
+This means YOLO inference (50–100 ms on Jetson Nano with .pt, ~20 ms with
+TensorRT .engine) never blocks the main camera/lane thread.
 """
 
-import cv2
+import queue
+import threading
 import numpy as np
 from typing import Tuple, Optional
 
 from perception_stack.config import (
-    SIGN_RED_S_MIN, SIGN_RED_V_MIN,
-    SIGN_RED_H_LOW_MAX, SIGN_RED_H_HIGH_MIN,
-    SIGN_MIN_AREA_PX, SIGN_MAX_AREA_PX,
-    SIGN_POLY_SIDES_MIN, SIGN_POLY_SIDES_MAX,
-    SIGN_ASPECT_MIN, SIGN_ASPECT_MAX,
-    SIGN_DIST_MIN_M, SIGN_DIST_MAX_M,
+    SIGN_MODEL_PATH,
+    SIGN_CONF_THRESH,
+    SIGN_IMG_SIZE,
+    SIGN_ACCEPT_CLASSES,
+    SIGN_SKIP_FRAMES,
+    SIGN_DIST_MIN_M,
+    SIGN_DIST_MAX_M,
+    SIGN_VOTE_NEEDED,
     ROI_TOP_FRACTION,
 )
 
-
-def _red_mask(frame: np.ndarray, H: int, W: int) -> np.ndarray:
-    """Two-range HSV red mask; red wraps at hue=0/180."""
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    lo1 = np.array([0,                   SIGN_RED_S_MIN, SIGN_RED_V_MIN])
-    hi1 = np.array([SIGN_RED_H_LOW_MAX,  255,            255           ])
-    lo2 = np.array([SIGN_RED_H_HIGH_MIN, SIGN_RED_S_MIN, SIGN_RED_V_MIN])
-    hi2 = np.array([180,                 255,            255           ])
-    mask = cv2.bitwise_or(cv2.inRange(hsv, lo1, hi1),
-                          cv2.inRange(hsv, lo2, hi2))
-    # Exclude sky / hood ROI
-    mask[:int(H * ROI_TOP_FRACTION), :] = 0
-    # Morphological clean-up
-    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  k)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
-    return mask
+_Result = Tuple[bool, float, Optional[Tuple[int, int, int, int]]]
 
 
-def detect_stop_sign(
-    frame: np.ndarray,
-    pc:    np.ndarray,
-    H: int, W: int,
-) -> Tuple[bool, float, Optional[Tuple[int, int, int, int]]]:
-    """
-    Detect a red octagonal stop sign in the frame.
+class StopSignDetector:
 
-    Returns:
-        detected  — True if a qualifying sign was found
-        dist_m    — forward distance to sign centroid via ZED point cloud
-        bbox      — (x, y, w, h) bounding box in image pixels, or None
-    """
-    mask = _red_mask(frame, H, W)
+    def __init__(self):
+        import os
+        self._enabled = os.path.isfile(SIGN_MODEL_PATH)
+        if not self._enabled:
+            print(f"[StopSign] WARNING: weights not found at '{SIGN_MODEL_PATH}' — "
+                  f"sign detection disabled.\n"
+                  f"           Run:  python scripts/train_stop_sign.py --api-key YOUR_KEY")
+            return
 
-    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not cnts:
-        return False, 0.0, None
+        from ultralytics import YOLO
+        self._model = YOLO(SIGN_MODEL_PATH)
 
-    best_cnt  = None
-    best_area = SIGN_MIN_AREA_PX - 1
+        # Warm-up: eliminate first-inference latency spike on Jetson
+        _dummy = np.zeros((SIGN_IMG_SIZE, SIGN_IMG_SIZE, 3), dtype=np.uint8)
+        self._model.predict(_dummy, imgsz=SIGN_IMG_SIZE, verbose=False, device=0)
 
-    for cnt in cnts:
-        area = cv2.contourArea(cnt)
-        if not (SIGN_MIN_AREA_PX <= area <= SIGN_MAX_AREA_PX):
-            continue
+        # Thread-safe result store
+        self._result: _Result = (False, 0.0, None)
+        self._lock = threading.Lock()
 
-        # Polygon approximation — epsilon ~3% of perimeter
-        peri  = cv2.arcLength(cnt, True)
-        approx = cv2.approxPolyDP(cnt, 0.03 * peri, True)
-        sides  = len(approx)
-        if not (SIGN_POLY_SIDES_MIN <= sides <= SIGN_POLY_SIDES_MAX):
-            continue
+        # Frame queue: maxsize=1 so worker always processes the latest frame
+        self._queue: queue.Queue = queue.Queue(maxsize=1)
 
-        # Aspect ratio — octagon bounding rect is nearly square
-        x, y, w, h = cv2.boundingRect(cnt)
-        if h == 0:
-            continue
-        aspect = w / h
-        if not (SIGN_ASPECT_MIN <= aspect <= SIGN_ASPECT_MAX):
-            continue
+        # Vote gate state (lives in worker thread — no lock needed)
+        self._votes:      int            = 0
+        self._last_dist:  float          = 0.0
+        self._last_bbox:  Optional[tuple] = None
 
-        if area > best_area:
-            best_area = area
-            best_cnt  = cnt
+        self._thread = threading.Thread(target=self._worker, daemon=True)
+        self._thread.start()
 
-    if best_cnt is None:
-        return False, 0.0, None
+    # ── Public API ─────────────────────────────────────────────────────────────
 
-    x, y, w, h = cv2.boundingRect(best_cnt)
-    cx = int(np.clip(x + w // 2, 0, W - 1))
-    cy = int(np.clip(y + h // 2, 0, H - 1))
+    def submit(self, frame: np.ndarray, pc: np.ndarray, H: int, W: int) -> None:
+        """
+        Post the latest frame for processing.  Non-blocking — drops the pending
+        frame if the worker hasn't consumed it yet (always keep the freshest).
+        frame is already a .copy() from the pipeline; pc is a ZED SDK view so
+        we copy it here before handing off to the worker thread.
+        """
+        if not self._enabled:
+            return
+        try:
+            self._queue.put_nowait((frame, pc.copy(), H, W))
+        except queue.Full:
+            pass  # worker is busy; this frame is dropped, next will be submitted
 
-    # Distance from point cloud — sample a small patch around centroid
-    r = max(4, h // 8)
-    y0, y1 = max(0, cy - r), min(H, cy + r)
-    x0, x1 = max(0, cx - r), min(W, cx + r)
-    patch_z = pc[y0:y1, x0:x1, 2]          # Z channel (forward = negative)
-    finite  = patch_z[np.isfinite(patch_z)]
-    finite  = finite[finite < 0]            # must be in front of camera
-    if finite.size >= 4:
-        dist_m = float(np.median(np.abs(finite)))
-    else:
-        dist_m = 0.0
+    def get_result(self) -> _Result:
+        """Non-blocking read of the latest confirmed detection."""
+        if not self._enabled:
+            return (False, 0.0, None)
+        with self._lock:
+            return self._result
 
-    if dist_m > 0 and not (SIGN_DIST_MIN_M <= dist_m <= SIGN_DIST_MAX_M):
-        return False, 0.0, None
+    # ── Worker ─────────────────────────────────────────────────────────────────
 
-    return True, dist_m, (int(x), int(y), int(w), int(h))
+    def _worker(self) -> None:
+        frame_idx = 0
+        MAX_VOTES = SIGN_VOTE_NEEDED + 5
+
+        while True:
+            frame, pc, H, W = self._queue.get()   # blocks until main submits
+            frame_idx += 1
+
+            # Skip YOLO on non-scheduled frames — GPU budget control
+            if frame_idx % SIGN_SKIP_FRAMES != 0:
+                continue
+
+            raw_detected, dist_m, bbox = self._run_yolo(frame, pc, H, W)
+
+            # Vote gate
+            if raw_detected:
+                self._votes = min(MAX_VOTES, self._votes + 1)
+                if dist_m > 0:
+                    self._last_dist = dist_m
+                if bbox is not None:
+                    self._last_bbox = bbox
+            else:
+                self._votes = max(0, self._votes - 1)
+
+            confirmed = self._votes >= SIGN_VOTE_NEEDED
+            with self._lock:
+                self._result = (
+                    confirmed,
+                    self._last_dist if confirmed else 0.0,
+                    self._last_bbox if confirmed else None,
+                )
+
+    def _run_yolo(
+        self, frame: np.ndarray, pc: np.ndarray, H: int, W: int
+    ) -> _Result:
+        results = self._model.predict(
+            frame,
+            imgsz=SIGN_IMG_SIZE,
+            conf=SIGN_CONF_THRESH,
+            verbose=False,
+            device=0,
+        )
+
+        best_conf = -1.0
+        best_bbox: Optional[Tuple[int, int, int, int]] = None
+        best_dist = 0.0
+
+        for r in results:
+            if r.boxes is None:
+                continue
+            for box in r.boxes:
+                cls = int(box.cls[0])
+                if cls not in SIGN_ACCEPT_CLASSES:
+                    continue
+                conf = float(box.conf[0])
+
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                cx = (x1 + x2) // 2
+                cy = (y1 + y2) // 2
+
+                # Exclude sky / hood region
+                if cy < int(H * ROI_TOP_FRACTION):
+                    continue
+
+                # Distance from point cloud — sample patch around centroid
+                r_patch = max(4, (y2 - y1) // 8)
+                py0 = max(0, cy - r_patch)
+                py1 = min(H, cy + r_patch)
+                px0 = max(0, cx - r_patch)
+                px1 = min(W, cx + r_patch)
+                patch_z = pc[py0:py1, px0:px1, 2]      # Z (negative = ahead)
+                finite  = patch_z[np.isfinite(patch_z)]
+                finite  = finite[finite < 0]
+                dist_m  = float(np.median(np.abs(finite))) if finite.size >= 4 else 0.0
+
+                if dist_m > 0 and not (SIGN_DIST_MIN_M <= dist_m <= SIGN_DIST_MAX_M):
+                    continue
+
+                if conf > best_conf:
+                    best_conf = conf
+                    best_bbox = (x1, y1, x2 - x1, y2 - y1)
+                    best_dist = dist_m
+
+        return (best_bbox is not None), best_dist, best_bbox

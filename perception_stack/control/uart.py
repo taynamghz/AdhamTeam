@@ -21,7 +21,7 @@ import time
 import serial                    # pyserial
 
 from perception_stack.config import (
-    UART_PORT, UART_BAUD, UART_TIMEOUT_S, UART_ACK_TIMEOUT_S,
+    UART_PORT, UART_BAUD, UART_TIMEOUT_S, UART_ACK_TIMEOUT_S, UART_HEARTBEAT_S,
 )
 
 log = logging.getLogger(__name__)
@@ -30,8 +30,9 @@ log = logging.getLogger(__name__)
 CMD_IDLE     = 0x00
 CMD_THROTTLE = 0x01
 CMD_BRAKE    = 0x02
+CMD_STEER    = 0x03   # DATA: 0=-30°, 127=0°, 255=+30°
 
-_CMD_NAME = {CMD_IDLE: "IDLE", CMD_THROTTLE: "THROTTLE", CMD_BRAKE: "BRAKE"}
+_CMD_NAME = {CMD_IDLE: "IDLE", CMD_THROTTLE: "THROTTLE", CMD_BRAKE: "BRAKE", CMD_STEER: "STEER"}
 
 _START = 0xAA
 
@@ -72,9 +73,10 @@ class UARTController:
     def __init__(self):
         self._ser:    serial.Serial | None = None
         self._lock    = threading.Lock()
-        self._last_cmd: int   = -1    # avoid repeat sends of the same command
-        self._last_val: int   = -1
-        self.connected: bool  = False
+        self._last_cmd:  int   = -1
+        self._last_val:  int   = -1
+        self._last_sent: float = 0.0   # epoch time of last actual write (watchdog)
+        self.connected:  bool  = False
 
     # ── Lifecycle ───────────────────────────────────────────────────────────────
 
@@ -108,14 +110,18 @@ class UARTController:
 
     def send(self, cmd: int, value: int = 0) -> bool:
         """
-        Transmit one command frame.  Skips duplicate (cmd, value) pairs to avoid
-        flooding the MCU with identical messages.  Returns True on success.
+        Transmit one command frame.
+
+        De-duplicates identical (cmd, value) pairs BUT forces a retransmit every
+        UART_HEARTBEAT_S seconds regardless — this keeps the Nucleo watchdog
+        (200 ms timeout) alive during sustained THROTTLE at constant speed.
         """
         if not self.connected or self._ser is None:
             return False
 
-        # De-duplicate
-        if cmd == self._last_cmd and value == self._last_val:
+        now = time.time()
+        heartbeat_due = (now - self._last_sent) >= UART_HEARTBEAT_S
+        if cmd == self._last_cmd and value == self._last_val and not heartbeat_due:
             return True
 
         frame = _build_frame(cmd, value)
@@ -128,8 +134,9 @@ class UARTController:
                 self.connected = False
                 return False
 
-        self._last_cmd = cmd
-        self._last_val = value
+        self._last_cmd  = cmd
+        self._last_val  = value
+        self._last_sent = now
         log.debug("[UART] → %s  val=%d", _CMD_NAME.get(cmd, f"0x{cmd:02X}"), value)
         return True
 

@@ -7,3 +7,13 @@ __pycache__/
 dist/
 build/
 .env
+
+# Training artifacts
+runs/
+stop_sign_dataset/
+*.pt
+*.engine
+*.onnx
+
+# Weights committed only when ready
+!perception_stack/weights/.gitkeep

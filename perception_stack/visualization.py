@@ -109,16 +109,6 @@ def draw(frame: np.ndarray, result: PerceptionResult,
         cv2.putText(vis, sign_label, (tx, ty),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2)
 
-    # Obstacle bounding box
-    if result.obstacle_detected and result.obstacle_bbox is not None:
-        ox, oy, ow, oh = result.obstacle_bbox
-        cv2.rectangle(vis, (ox, oy), (ox + ow, oy + oh), (0, 0, 255), 3)
-        side = ("L" if result.obstacle_lateral_m > 0.1
-                else "R" if result.obstacle_lateral_m < -0.1 else "C")
-        obs_label = f"OBS {result.obstacle_dist_m:.1f}m {side}"
-        cv2.putText(vis, obs_label, (ox, max(oy - 8, 12)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-
     # Lookahead point marker
     if result.lookahead_pixel is not None:
         lx_pt, ly_pt = result.lookahead_pixel
@@ -137,7 +127,7 @@ def draw(frame: np.ndarray, result: PerceptionResult,
     cs = ("CENTER" if abs(result.deviation_m) < thresh
           else "LEFT" if result.deviation_m > 0 else "RIGHT")
 
-    cv2.rectangle(vis, (0, 0), (W, 162), (0,0,0), -1)
+    cv2.rectangle(vis, (0, 0), (W, 140), (0,0,0), -1)
     cv2.putText(vis,
         f"Source:{result.source}{virt_tag}  Conf:{result.confidence:.0%}  "
         f"Width:{result.lane_width_m:.2f}m",
@@ -150,14 +140,9 @@ def draw(frame: np.ndarray, result: PerceptionResult,
                  if result.stop_line else "No stop line")
     cv2.putText(vis, stop_info, (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
                 (0,0,255) if result.stop_line else (80,80,80), 2)
-    obs_info = (f"OBSTACLE: {result.obstacle_dist_m:.1f}m  "
-                f"lat:{result.obstacle_lateral_m:+.2f}m"
-                if result.obstacle_detected else "No obstacle")
-    cv2.putText(vis, obs_info, (10, 113), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-                (0, 0, 255) if result.obstacle_detected else (80, 80, 80), 2)
     sign_info = (f"STOP SIGN: {result.stop_sign_dist_m:.1f}m"
                  if result.stop_sign else "No stop sign")
-    cv2.putText(vis, sign_info, (10, 133), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+    cv2.putText(vis, sign_info, (10, 113), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
                 (0, 0, 200) if result.stop_sign else (80, 80, 80), 2)
     # Control outputs row
     lhd_str = (f"  LA:{result.lookahead_point[1]:.1f}m"

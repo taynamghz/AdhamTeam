@@ -23,8 +23,8 @@ def main():
     print(f"{'Frame':>6} | {'Source':>12} | {'Dev(m)':>8} | "
           f"{'Width':>7} | {'Conf':>5} | {'Status':>7} | {'Cmd':>8} | "
           f"{'Head(°)':>8} | {'Curv(m⁻¹)':>10} | {'LA(m)':>6} | "
-          f"Stop       | Sign       | Obstacle")
-    print("-" * 155)
+          f"Stop       | Sign")
+    print("-" * 120)
 
     fc = 0
     try:
@@ -51,9 +51,6 @@ def main():
                       else "LEFT"   if result.deviation_m > 0 else "RIGHT")
                 stop_str = (f"STOP@{result.stop_line_dist:.1f}m"
                             if result.stop_line else "-")
-                obs_str  = (f"OBS@{result.obstacle_dist_m:.1f}m "
-                            f"lat{result.obstacle_lateral_m:+.2f}m"
-                            if result.obstacle_detected else "-")
                 sign_str = (f"SIGN@{result.stop_sign_dist_m:.1f}m"
                             if result.stop_sign else "-")
                 la_str   = (f"{result.lookahead_point[1]:.1f}"
@@ -66,7 +63,7 @@ def main():
                       f"{_math.degrees(result.heading_angle):>+8.1f} | "
                       f"{result.curvature:>+10.4f} | "
                       f"{la_str:>6} | "
-                      f"{stop_str:<10} | {sign_str:<10} | {obs_str}")
+                      f"{stop_str:<10} | {sign_str}")
 
     finally:
         cmd.close()

@@ -8,8 +8,12 @@ import numpy as np
 import pyzed.sl as sl
 
 # ── Camera ─────────────────────────────────────────────────────────────────────
-CAM_RES = sl.RESOLUTION.HD720
-CAM_FPS  = 30
+CAM_RES        = sl.RESOLUTION.HD720
+CAM_FPS        = 30
+# NEURAL  = best depth quality, heaviest GPU load (~15-18 FPS real on Nano)
+# QUALITY = slightly noisier depth, ~2× faster — recommended for real-time
+# ULTRA   = fastest, noisiest — only if QUALITY still too slow
+CAM_DEPTH_MODE = sl.DEPTH_MODE.QUALITY
 
 # ── Floor detection ────────────────────────────────────────────────────────────
 FLOOR_TOLERANCE      = 0.10     # ±m around floor plane (nominal)
@@ -80,28 +84,18 @@ LANE_MEM_MAX = 60               # rolling history length (frames × 5 samples)
 CONF_WHITE = 0.22
 CONF_GRASS = 0.22
 
-# ── Obstacle detection ─────────────────────────────────────────────────────────
-OBS_MIN_HEIGHT_M   = 0.15    # m above floor — ignores road surface / small bumps
-OBS_MAX_HEIGHT_M   = 2.50    # m above floor — ignores overhead signs
-OBS_MIN_DIST_M     = 0.30    # closest distance to report
-OBS_MAX_DIST_M     = 4.00    # furthest distance to report
-OBS_LANE_MARGIN_M  = 0.40    # lateral margin beyond lane edges still counts
-OBS_MIN_CLUSTER_PX = 60      # minimum point-cloud points per blob (noise rejection)
-OBS_SDK_ENABLE     = False   # enable ZED object detection (people / vehicles)
-
-# ── Stop-sign detection ────────────────────────────────────────────────────────
-# Red HSV ranges (hue wraps: 0-H_LOW_MAX and H_HIGH_MIN-180)
-SIGN_RED_H_LOW_MAX   = 10      # upper bound of low-red hue band
-SIGN_RED_H_HIGH_MIN  = 160     # lower bound of high-red hue band
-SIGN_RED_S_MIN       = 120     # minimum saturation — reject pale/pink
-SIGN_RED_V_MIN       = 60      # minimum value — reject very dark red
-# Contour / shape filters
-SIGN_MIN_AREA_PX     = 800     # ignore tiny blobs (far-away / noise)
-SIGN_MAX_AREA_PX     = 80_000  # ignore blobs that fill most of the frame
-SIGN_POLY_SIDES_MIN  = 6       # octagon seen at distance may appear 6-sided
-SIGN_POLY_SIDES_MAX  = 10      # allow some detection slop
-SIGN_ASPECT_MIN      = 0.5     # bounding-rect W/H — rejects thin red banners
-SIGN_ASPECT_MAX      = 1.8
+# ── Stop-sign detection (YOLOv8) ──────────────────────────────────────────────
+# Train: python scripts/train_stop_sign.py --api-key YOUR_KEY
+# Export to TensorRT (run on Jetson): python scripts/export_trt.py
+# Roboflow dataset: universe.roboflow.com/yolo-ifyjn/stop-sign-detection-1
+#   class 0 = stop-sign          ← real sign, we want this
+#   class 1 = stop-sign-fake
+#   class 2 = stop-sign-vandalized  ← still a real stop sign
+SIGN_MODEL_PATH      = "weights/stop_sign.pt"   # swap to .engine after TRT export
+SIGN_CONF_THRESH     = 0.45                      # YOLO confidence threshold
+SIGN_IMG_SIZE        = 416                       # inference resolution (faster on Nano)
+SIGN_ACCEPT_CLASSES  = {0, 2}                    # 0=stop-sign, 2=stop-sign-vandalized
+SIGN_SKIP_FRAMES     = 3                         # run YOLO every N frames; cache between
 # Distance gate
 SIGN_DIST_MIN_M      = 0.5
 SIGN_DIST_MAX_M      = 15.0
@@ -124,11 +118,12 @@ UART_PORT          = "/dev/ttyTHS1" # Jetson hardware UART; change to /dev/ttyUS
 UART_BAUD          = 115200
 UART_TIMEOUT_S     = 0.01           # serial read timeout (s)
 UART_ACK_TIMEOUT_S = 0.05           # how long to wait for MCU echo (s)
+UART_HEARTBEAT_S   = 0.080          # force retransmit every 80ms — keeps Nucleo watchdog
+                                    # alive (200ms timeout) during sustained THROTTLE
 
 # ── Vehicle commands ────────────────────────────────────────────────────────────
-BRAKE_DIST_M       = 1.5   # m — obstacle closer than this triggers BRAKE
 STOP_BRAKE_DIST_M  = 1.0   # m — stop line/sign must be within this to trigger BRAKE
-THROTTLE_VALUE     = 20    # 0-255 sent with THROTTLE frame
+THROTTLE_VALUE     = 189   # 0-255 sent with THROTTLE frame
 BRAKE_VALUE        = 255   # 0-255 sent with BRAKE frame
 
 # ── Control outputs ────────────────────────────────────────────────────────────
@@ -143,3 +138,8 @@ CTRL_EVAL_Y_FRAC     = 0.60
 
 # ── Display ────────────────────────────────────────────────────────────────────
 DISPLAY = True
+
+# ── Profiling ──────────────────────────────────────────────────────────────────
+# Prints per-step timing table every 30 frames to identify bottlenecks.
+PROFILE_ENABLED      = True
+PROFILE_PRINT_EVERY  = 30   # frames

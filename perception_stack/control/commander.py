@@ -5,9 +5,8 @@ control/commander.py  |  High-level command decision layer.
 Takes a PerceptionResult every frame and decides what to tell the
 low-level controller:
 
-    BRAKE    — obstacle detected within BRAKE_DIST_M
-    THROTTLE — lane visible, no close obstacle
-    IDLE     — lane completely lost (source == LOST or NO_FLOOR)
+    BRAKE    — stop line or stop sign within STOP_BRAKE_DIST_M
+    THROTTLE — no stop trigger active
 
 The commander owns a UARTController and handles open/close.
 """
@@ -15,9 +14,7 @@ The commander owns a UARTController and handles open/close.
 import logging
 
 from perception_stack.config  import (
-    BRAKE_DIST_M, UART_ENABLED,
-    THROTTLE_VALUE, BRAKE_VALUE,
-    STOP_BRAKE_DIST_M,
+    UART_ENABLED, THROTTLE_VALUE, BRAKE_VALUE, STOP_BRAKE_DIST_M,
 )
 from perception_stack.models  import PerceptionResult
 from perception_stack.control.uart import UARTController, CMD_IDLE, CMD_THROTTLE, CMD_BRAKE
@@ -72,12 +69,7 @@ class Commander:
                 self.uart.idle()
 
         if state != self._state:
-            log.info(
-                "[Commander] %s → %s  (obs=%.2fm  src=%s)",
-                self._state, state,
-                result.obstacle_dist_m if result.obstacle_detected else -1.0,
-                result.source,
-            )
+            log.info("[Commander] %s → %s  (src=%s)", self._state, state, result.source)
             self._state = state
 
         return state
@@ -86,17 +78,13 @@ class Commander:
 
     @staticmethod
     def _decide(result: PerceptionResult) -> str:
-        # 1. Obstacle inside brake zone — hard stop regardless of lane state
-        if result.obstacle_detected and result.obstacle_dist_m <= BRAKE_DIST_M:
-            return "BRAKE"
-
-        # 2. Stop line confirmed and within brake distance
+        # 1. Stop line confirmed and within brake distance
         if result.stop_line and 0 < result.stop_line_dist <= STOP_BRAKE_DIST_M:
             return "BRAKE"
 
-        # 3. Stop sign confirmed and within brake distance
+        # 2. Stop sign confirmed and within brake distance
         if result.stop_sign and 0 < result.stop_sign_dist_m <= STOP_BRAKE_DIST_M:
             return "BRAKE"
 
-        # 4. No stop trigger — go forward regardless of lane state
+        # 3. No stop trigger — go forward
         return "THROTTLE"
