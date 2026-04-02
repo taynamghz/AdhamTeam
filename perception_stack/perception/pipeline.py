@@ -31,11 +31,12 @@ from perception_stack.config import (
     MIN_LANE_SEP_PX,
     LANE_SEP_MEM_FRAC,
     PROFILE_ENABLED, PROFILE_PRINT_EVERY,
-    # Phase 1–3 additions
     CLAHE_CLIP_LIMIT, CLAHE_TILE_SIZE,
     OBS_VOTE_NEEDED,
     PARK_VOTE_NEEDED,
     FPS_WARN_BELOW,
+    PC_REFRESH_EVERY,
+    LANE_ENABLED,
 )
 from perception_stack.models import PerceptionResult
 from perception_stack.lane.fitting import fit_lanes, eval_x
@@ -110,6 +111,10 @@ class LanePerception:
         self._last_park_empty:  bool  = False
         self._last_park_center        = None   # Optional[Tuple[float, float]]
         self._last_park_angle:  float = 0.0
+
+        # Point-cloud cache — retrieved conditionally, not every frame
+        self._pc_cache: Optional[np.ndarray] = None
+        self._pc_age:   int                  = PC_REFRESH_EVERY  # force fetch on frame 1
 
         # Rolling frame-time buffer for FPS monitoring (last 30 frame timestamps)
         self._frame_times: collections.deque = collections.deque(maxlen=30)
@@ -300,194 +305,194 @@ class LanePerception:
         self.cam.retrieve_image(self.image_mat, sl.VIEW.LEFT)
         frame = self.image_mat.get_data()[:, :, :3].copy()
 
-        self.cam.retrieve_measure(self.pc_mat, sl.MEASURE.XYZ, sl.MEM.CPU)
-        pc = self.pc_mat.get_data()[:, :, :3]
-
-        self.cam.get_position(self.pose)
-
-        # ── CLAHE normalisation (lighting-invariant colour thresholding) ──────
+        # CLAHE helps YOLO yellow-board gate in all lighting conditions
         frame_norm = self._apply_clahe(frame)
 
-        # ── ZED IMU: pitch/roll for tilt-compensated BEV ──────────────────────
-        pitch_deg, roll_deg = self._read_imu()
+        # ── Conditional point-cloud retrieval ─────────────────────────────────
+        # Refresh every PC_REFRESH_EVERY frames, or immediately when a sign
+        # candidate is being tracked (fresh depth = accurate distance).
+        self._pc_age += 1
+        sign_active = self.sign_detector.get_result()[0]  # non-blocking read
+        need_pc = (
+            self._pc_cache is None
+            or self._pc_age >= PC_REFRESH_EVERY
+            or sign_active
+        )
+        if need_pc:
+            self.cam.retrieve_measure(self.pc_mat, sl.MEASURE.XYZ, sl.MEM.CPU)
+            self._pc_cache = self.pc_mat.get_data()[:, :, :3].copy()
+            self._pc_age = 0
+        pc = self._pc_cache
 
         if PROFILE_ENABLED: t = self._tick("grab+retrieve", t)
 
-        # ── Post normalised frame to sign detector (non-blocking) ─────────────
-        # frame_norm improves yellow-board gate reliability in sign detector.
+        # ── Stop-sign detector (non-blocking submit to worker thread) ─────────
         self.sign_detector.submit(frame_norm, pc, self.H, self.W)
+        sign_confirmed, sign_dist, sign_bbox = self.sign_detector.get_result()
 
-        # ── Floor ─────────────────────────────────────────────────────────────
-        if not self._update_floor():
-            return PerceptionResult(source="NO_FLOOR"), frame, None, None, None
+        if PROFILE_ENABLED: t = self._tick("sign_detect", t)
 
-        fm = self._floor_mask(pc)
-        if PROFILE_ENABLED: t = self._tick("floor", t)
+        # ── Lane / floor / obstacle / parking (disabled until LANE_ENABLED) ───
+        fm = wm = gm = None
+        lf = rf = None
+        lc = rc = 0.0
+        dev = wid = 0.0
+        virt_left = virt_right = False
+        stop_confirmed = False
+        out_y = None
+        out_dist = 0.0
+        obs_confirmed = False
+        park_confirmed = False
+        heading_sm = self._last_heading
+        curv_sm    = self._last_curvature
+        lookahead_world = lookahead_px = None
+        source = "DISABLED"
 
-        # ── Tilt-compensated BEV update (IMU-driven, runs only when WARP is on) ─
-        if WARP_ENABLED and self.warp.M is not None:
-            self.warp.update_tilt(pitch_deg, roll_deg, self.W, self.H)
+        if LANE_ENABLED:
+            pitch_deg, roll_deg = self._read_imu()
+            self.cam.get_position(self.pose)
 
-        # ── Colour masks (on CLAHE-normalised frame) ──────────────────────────
-        wm, gm, hls, hsv = self._color_masks(frame_norm, fm)
-        if PROFILE_ENABLED: t = self._tick("color_masks", t)
+            if not self._update_floor():
+                return PerceptionResult(source="NO_FLOOR"), frame, None, None, None
 
-        # ── Lane fitting ──────────────────────────────────────────────────────
-        wl, wr, wlc, wrc = self._fit_mask(wm)
+            fm = self._floor_mask(pc)
+            if PROFILE_ENABLED: t = self._tick("floor", t)
 
-        if max(wlc, wrc) < CONF_WHITE:
-            ge = cv2.Canny(gm, 50, 150)
-            gl, gr, glc, grc = self._fit_mask(ge)
-        else:
-            gl = gr = None
-            glc = grc = 0.0
+            if WARP_ENABLED and self.warp.M is not None:
+                self.warp.update_tilt(pitch_deg, roll_deg, self.W, self.H)
 
-        def best(opts):
-            v = [(f, c) for f, c in opts if f is not None and c > 0.05]
-            return max(v, key=lambda x: x[1]) if v else (None, 0.0)
+            wm, gm, hls, hsv = self._color_masks(frame_norm, fm)
+            if PROFILE_ENABLED: t = self._tick("color_masks", t)
 
-        raw_l, lc = best([(wl, wlc * 1.4), (gl, glc)])
-        raw_r, rc = best([(wr, wrc * 1.4), (gr, grc)])
+            wl, wr, wlc, wrc = self._fit_mask(wm)
+            if max(wlc, wrc) < CONF_WHITE:
+                ge = cv2.Canny(gm, 50, 150)
+                gl, gr, glc, grc = self._fit_mask(ge)
+            else:
+                gl = gr = None
+                glc = grc = 0.0
 
-        # Contamination guard
-        if raw_l is not None and raw_r is not None:
-            y_g = int(self.H * 0.85)
-            sep = eval_x(raw_r, y_g) - eval_x(raw_l, y_g)
-            too_close = sep < MIN_LANE_SEP_PX
-            if not too_close and self.lane_mem.mean_px is not None:
-                too_close = sep < LANE_SEP_MEM_FRAC * self.lane_mem.mean_px
-            if too_close:
-                lx = eval_x(raw_l, y_g)
-                rx = eval_x(raw_r, y_g)
-                if self.lane_mem.mean_px is not None:
-                    r_err = abs(rx - (lx + self.lane_mem.mean_px))
-                    l_err = abs(lx - (rx - self.lane_mem.mean_px))
-                    if r_err >= l_err:
+            def best(opts):
+                v = [(f, c) for f, c in opts if f is not None and c > 0.05]
+                return max(v, key=lambda x: x[1]) if v else (None, 0.0)
+
+            raw_l, lc = best([(wl, wlc * 1.4), (gl, glc)])
+            raw_r, rc = best([(wr, wrc * 1.4), (gr, grc)])
+
+            if raw_l is not None and raw_r is not None:
+                y_g = int(self.H * 0.85)
+                sep = eval_x(raw_r, y_g) - eval_x(raw_l, y_g)
+                too_close = sep < MIN_LANE_SEP_PX
+                if not too_close and self.lane_mem.mean_px is not None:
+                    too_close = sep < LANE_SEP_MEM_FRAC * self.lane_mem.mean_px
+                if too_close:
+                    lx = eval_x(raw_l, y_g)
+                    rx = eval_x(raw_r, y_g)
+                    if self.lane_mem.mean_px is not None:
+                        r_err = abs(rx - (lx + self.lane_mem.mean_px))
+                        l_err = abs(lx - (rx - self.lane_mem.mean_px))
+                        if r_err >= l_err:
+                            raw_r, rc = None, 0.0
+                            self.smoother.r_ema = None
+                        else:
+                            raw_l, lc = None, 0.0
+                            self.smoother.l_ema = None
+                    elif lc >= rc:
                         raw_r, rc = None, 0.0
                         self.smoother.r_ema = None
                     else:
                         raw_l, lc = None, 0.0
                         self.smoother.l_ema = None
-                elif lc >= rc:
-                    raw_r, rc = None, 0.0
-                    self.smoother.r_ema = None
-                else:
-                    raw_l, lc = None, 0.0
-                    self.smoother.l_ema = None
 
-        if raw_l is not None: self._prev_lf = raw_l
-        if raw_r is not None: self._prev_rf = raw_r
+            if raw_l is not None: self._prev_lf = raw_l
+            if raw_r is not None: self._prev_rf = raw_r
 
-        lf, rf = self.smoother.update(raw_l, raw_r)
+            lf, rf = self.smoother.update(raw_l, raw_r)
+            virt_left = virt_right = False
+            self.lane_mem.update(lf, rf, pc, self.H, self.W)
+            fx = self.cal.fx
+            if lf is None and rf is not None:
+                vlf = self.lane_mem.virtual_left(rf, pc, self.H, self.W, fx)
+                if vlf is not None:
+                    lf, virt_left = vlf, True
+            if rf is None and lf is not None:
+                vrf = self.lane_mem.virtual_right(lf, pc, self.H, self.W, fx)
+                if vrf is not None:
+                    rf, virt_right = vrf, True
 
-        # Virtual boundaries
-        virt_left = virt_right = False
-        self.lane_mem.update(lf, rf, pc, self.H, self.W)
-        fx = self.cal.fx
+            if PROFILE_ENABLED: t = self._tick("lane_fitting", t)
 
-        if lf is None and rf is not None:
-            vlf = self.lane_mem.virtual_left(rf, pc, self.H, self.W, fx)
-            if vlf is not None:
-                lf, virt_left = vlf, True
-        if rf is None and lf is not None:
-            vrf = self.lane_mem.virtual_right(lf, pc, self.H, self.W, fx)
-            if vrf is not None:
-                rf, virt_right = vrf, True
+            if wlc > CONF_WHITE or wrc > CONF_WHITE:
+                source = "WHITE_LINE"
+            elif glc > CONF_GRASS or grc > CONF_GRASS:
+                source = "GRASS"
+            else:
+                source = "LOST"
 
-        if PROFILE_ENABLED: t = self._tick("lane_fitting", t)
+            if lf is not None or rf is not None:
+                dev, wid = compute_deviation(lf, rf, pc, self.H, self.W)
+            if source != "LOST":
+                self._last_deviation = dev
+            else:
+                dev = self._last_deviation
 
-        # ── Source label + deviation ──────────────────────────────────────────
-        if wlc > CONF_WHITE or wrc > CONF_WHITE:
-            source = "WHITE_LINE"
-        elif glc > CONF_GRASS or grc > CONF_GRASS:
-            source = "GRASS"
-        else:
-            source = "LOST"
+            raw_stop, raw_y, raw_dist = detect_stop_line(
+                frame, fm, lf, rf, pc, self.H, self.W, hls, hsv)
+            MAX_VOTES = STOP_VOTE_NEEDED + 5
+            self._stop_votes = (min(MAX_VOTES, self._stop_votes + 1) if raw_stop
+                                else max(0, self._stop_votes - 1))
+            if raw_stop and raw_dist > 0:
+                self._last_stop_dist = raw_dist
+            if raw_stop and raw_y is not None:
+                self._last_stop_y = raw_y
 
-        dev = wid = 0.0
-        if lf is not None or rf is not None:
-            dev, wid = compute_deviation(lf, rf, pc, self.H, self.W)
+            if PROFILE_ENABLED: t = self._tick("stop_line", t)
 
-        if source != "LOST":
-            self._last_deviation = dev
-        else:
-            dev = self._last_deviation
+            sign_prearmed = sign_confirmed and 3.0 <= sign_dist <= 8.0
+            effective_stop_thresh = max(2, STOP_VOTE_NEEDED - (2 if sign_prearmed else 0))
+            stop_confirmed = self._stop_votes >= effective_stop_thresh
+            out_y    = self._last_stop_y    if stop_confirmed else None
+            out_dist = self._last_stop_dist if stop_confirmed else 0.0
 
-        # ── Stop line ─────────────────────────────────────────────────────────
-        raw_stop, raw_y, raw_dist = detect_stop_line(
-            frame, fm, lf, rf, pc, self.H, self.W, hls, hsv)
+            raw_obs, raw_obs_dist, raw_obs_lat = detect_obstacle(
+                frame_norm, fm, lf, rf, pc, self.H, self.W, hsv)
+            MAX_OBS = OBS_VOTE_NEEDED + 3
+            self._obs_votes = (min(MAX_OBS, self._obs_votes + 1) if raw_obs
+                               else max(0, self._obs_votes - 1))
+            if raw_obs and raw_obs_dist > 0:
+                self._last_obs_dist = raw_obs_dist
+                self._last_obs_lat  = raw_obs_lat
+            obs_confirmed = self._obs_votes >= OBS_VOTE_NEEDED
 
-        MAX_VOTES = STOP_VOTE_NEEDED + 5
-        self._stop_votes = (min(MAX_VOTES, self._stop_votes + 1) if raw_stop
-                            else max(0, self._stop_votes - 1))
-        if raw_stop and raw_dist > 0:
-            self._last_stop_dist = raw_dist
-        if raw_stop and raw_y is not None:
-            self._last_stop_y = raw_y
+            raw_park, raw_park_empty, raw_park_center, raw_park_angle = detect_parking_bay(
+                frame_norm, fm, lf, rf, pc, self.H, self.W, hsv, self.floor_y)
+            MAX_PARK = PARK_VOTE_NEEDED + 3
+            self._park_votes = (min(MAX_PARK, self._park_votes + 1) if raw_park
+                                else max(0, self._park_votes - 1))
+            if raw_park:
+                self._last_park_empty  = raw_park_empty
+                self._last_park_center = raw_park_center
+                self._last_park_angle  = raw_park_angle
+            park_confirmed = self._park_votes >= PARK_VOTE_NEEDED
 
-        if PROFILE_ENABLED: t = self._tick("stop_line", t)
+            if PROFILE_ENABLED: t = self._tick("obstacle+parking", t)
 
-        # ── Stop sign result (fast read from worker thread) ───────────────────
-        # Read here — before stop-line confirmation — so the prearmed flag can
-        # lower the stop-line voting threshold when a sign is confirmed at 3–8 m.
-        sign_confirmed, out_sign_dist, out_sign_bbox = self.sign_detector.get_result()
+            y_ctrl = int(self.H * CTRL_EVAL_Y_FRAC)
+            wid_px = 0.0
+            if lf is not None and rf is not None:
+                wid_px = abs(eval_x(rf, y_ctrl) - eval_x(lf, y_ctrl))
+            have_valid_lane = (lf is not None or rf is not None) and wid > 0.0
+            if have_valid_lane:
+                heading_raw = compute_heading(lf, rf, y_ctrl)
+                curv_raw    = compute_curvature(lf, rf, y_ctrl, wid_px, wid)
+                h_sm, k_sm  = self.ctrl_smoother.update(heading_raw, curv_raw)
+                self._last_heading   = h_sm
+                self._last_curvature = k_sm
+            heading_sm = self._last_heading
+            curv_sm    = self._last_curvature
+            lookahead_world, lookahead_px = compute_lookahead(lf, rf, pc, self.H, self.W)
 
-        # ── Stop line confirmation with pre-arm ───────────────────────────────
-        # When the sign is confirmed nearby, lower the threshold so the stop line
-        # is confirmed faster (sign and line always appear together at SEM).
-        sign_prearmed        = sign_confirmed and 3.0 <= out_sign_dist <= 8.0
-        effective_stop_thresh = max(2, STOP_VOTE_NEEDED - (2 if sign_prearmed else 0))
-        stop_confirmed = self._stop_votes >= effective_stop_thresh
-        out_y    = self._last_stop_y    if stop_confirmed else None
-        out_dist = self._last_stop_dist if stop_confirmed else 0.0
-
-        # ── Obstacle detection ────────────────────────────────────────────────
-        raw_obs, raw_obs_dist, raw_obs_lat = detect_obstacle(
-            frame_norm, fm, lf, rf, pc, self.H, self.W, hsv)
-
-        MAX_OBS = OBS_VOTE_NEEDED + 3
-        self._obs_votes = (min(MAX_OBS, self._obs_votes + 1) if raw_obs
-                           else max(0, self._obs_votes - 1))
-        if raw_obs and raw_obs_dist > 0:
-            self._last_obs_dist = raw_obs_dist
-            self._last_obs_lat  = raw_obs_lat
-        obs_confirmed = self._obs_votes >= OBS_VOTE_NEEDED
-
-        # ── Parking bay detection ─────────────────────────────────────────────
-        raw_park, raw_park_empty, raw_park_center, raw_park_angle = detect_parking_bay(
-            frame_norm, fm, lf, rf, pc, self.H, self.W, hsv, self.floor_y)
-
-        MAX_PARK = PARK_VOTE_NEEDED + 3
-        self._park_votes = (min(MAX_PARK, self._park_votes + 1) if raw_park
-                            else max(0, self._park_votes - 1))
-        if raw_park:
-            self._last_park_empty  = raw_park_empty
-            self._last_park_center = raw_park_center
-            self._last_park_angle  = raw_park_angle
-        park_confirmed = self._park_votes >= PARK_VOTE_NEEDED
-
-        if PROFILE_ENABLED: t = self._tick("obstacle+parking", t)
-
-        # ── Control outputs ───────────────────────────────────────────────────
-        y_ctrl = int(self.H * CTRL_EVAL_Y_FRAC)
-
-        wid_px = 0.0
-        if lf is not None and rf is not None:
-            wid_px = abs(eval_x(rf, y_ctrl) - eval_x(lf, y_ctrl))
-
-        have_valid_lane = (lf is not None or rf is not None) and wid > 0.0
-        if have_valid_lane:
-            heading_raw = compute_heading(lf, rf, y_ctrl)
-            curv_raw    = compute_curvature(lf, rf, y_ctrl, wid_px, wid)
-            h_sm, k_sm  = self.ctrl_smoother.update(heading_raw, curv_raw)
-            self._last_heading   = h_sm
-            self._last_curvature = k_sm
-        heading_sm = self._last_heading
-        curv_sm    = self._last_curvature
-
-        lookahead_world, lookahead_px = compute_lookahead(lf, rf, pc, self.H, self.W)
-
-        if PROFILE_ENABLED: t = self._tick("control", t)
+            if PROFILE_ENABLED: t = self._tick("control", t)
 
         # ── Profiling print ───────────────────────────────────────────────────
         if PROFILE_ENABLED and self.frame_cnt % PROFILE_PRINT_EVERY == 0:
@@ -518,13 +523,12 @@ class LanePerception:
             virtual_left       = virt_left,
             virtual_right      = virt_right,
             stop_sign          = sign_confirmed,
-            stop_sign_dist_m   = out_sign_dist,
-            stop_sign_bbox     = out_sign_bbox,
+            stop_sign_dist_m   = sign_dist,
+            stop_sign_bbox     = sign_bbox,
             heading_angle      = heading_sm,
             curvature          = curv_sm,
             lookahead_point    = lookahead_world,
             lookahead_pixel    = lookahead_px,
-            # Phase 1–3: obstacle + parking
             obstacle_detected  = obs_confirmed,
             obstacle_dist_m    = self._last_obs_dist if obs_confirmed else 0.0,
             obstacle_lateral_m = self._last_obs_lat  if obs_confirmed else 0.0,

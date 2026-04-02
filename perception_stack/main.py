@@ -7,7 +7,8 @@ import json
 import os
 import time
 import cv2
-from perception_stack.config import DISPLAY, LOG_TELEMETRY, LOG_DIR
+from collections import deque
+from perception_stack.config import DISPLAY, LOG_TELEMETRY, LOG_DIR, LANE_ENABLED
 from perception_stack.perception.pipeline import LanePerception
 from perception_stack.control.commander import Commander
 from perception_stack.visualization import draw
@@ -70,22 +71,37 @@ def main():
 
     logger = TelemetryLogger(LOG_DIR) if LOG_TELEMETRY else None
 
+    if DISPLAY:
+        cv2.namedWindow("PSU Eco Racing — Perception v4", cv2.WINDOW_NORMAL)
+        cv2.resizeWindow("PSU Eco Racing — Perception v4", 1280, 720)
+
     print("\nPerception v4 — press Q to quit\n")
-    print(f"{'Frame':>6} | {'Source':>12} | {'Dev(m)':>8} | "
-          f"{'Width':>7} | {'Conf':>5} | {'Status':>7} | {'Cmd':>8} | "
-          f"{'Head(°)':>8} | {'Curv(m⁻¹)':>10} | {'LA(m)':>6} | "
-          f"Stop       | Sign")
-    print("-" * 120)
+    if LANE_ENABLED:
+        print(f"{'Frame':>6} | {'Source':>12} | {'Dev(m)':>8} | {'Width':>7} | "
+              f"{'Conf':>5} | {'Cmd':>8} | Stop       | Sign")
+        print("-" * 90)
+    else:
+        print(f"{'Frame':>6} | {'FPS':>6} | {'Sign':>8} | {'Dist(m)':>8} | {'Cmd':>8}")
+        print("-" * 50)
 
     fc = 0
+    _disp_counter = 0
+    _fps_times: deque = deque(maxlen=30)
+    _fps_val: float = 0.0
     try:
         while True:
+            _t0 = time.perf_counter()
             out = perc.process()
             if out is None:
                 continue
 
             result, frame, fm, wm, gm = out
             fc += 1
+
+            # Rolling FPS over last 30 frames
+            _fps_times.append(time.perf_counter() - _t0)
+            if len(_fps_times) >= 2:
+                _fps_val = 1.0 / (sum(_fps_times) / len(_fps_times))
 
             # ── Send command to low-level controller ──────────────────────────
             control_cmd = cmd.update(result)
@@ -94,37 +110,31 @@ def main():
                 logger.log(fc, result, control_cmd)
 
             if DISPLAY:
-                vis = draw(frame, result, fm, wm, gm, perc.H, perc.W)
-                cv2.imshow("PSU Eco Racing — Perception v4", vis)
-                if cv2.waitKey(1) & 0xFF == ord('q'):
+                _disp_counter += 1
+                if _disp_counter % 3 == 0:  # ~10 fps display to reduce CPU load
+                    vis = draw(frame, result, fm, wm, gm, perc.H, perc.W,
+                               control_cmd, _fps_val)
+                    cv2.imshow("PSU Eco Racing — Perception v4", vis)
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q'):
                     break
 
             if fc % 30 == 0:
-                import math as _math
-                cs = ("CENTER" if abs(result.deviation_m) < 0.1
-                      else "LEFT"   if result.deviation_m > 0 else "RIGHT")
-                stop_str = (f"STOP@{result.stop_line_dist:.1f}m"
-                            if result.stop_line else "-")
-                sign_str = (f"SIGN@{result.stop_sign_dist_m:.1f}m"
-                            if result.stop_sign else "-")
-                la_str   = (f"{result.lookahead_point[1]:.1f}"
-                            if result.lookahead_point is not None else "--")
-                obs_str  = (f"OBS@{result.obstacle_dist_m:.1f}m"
-                            f"({'R' if result.obstacle_lateral_m > 0 else 'L'})"
-                            if result.obstacle_detected else "-")
-                park_str = (f"PARK@{result.parking_center_m[1]:.1f}m"
-                            f"({'OK' if result.parking_empty else 'BLK'})"
-                            if result.parking_detected else "-")
-                print(f"{fc:>6} | {result.source:>12} | "
-                      f"{result.deviation_m:>+8.3f} | "
-                      f"{result.lane_width_m:>7.2f} | "
-                      f"{result.confidence:>5.0%} | "
-                      f"{cs:>7} | {control_cmd:>8} | "
-                      f"{_math.degrees(result.heading_angle):>+8.1f} | "
-                      f"{result.curvature:>+10.4f} | "
-                      f"{la_str:>6} | "
-                      f"{stop_str:<10} | {sign_str:<12} | "
-                      f"{obs_str:<14} | {park_str}")
+                if LANE_ENABLED:
+                    import math as _math
+                    cs = ("CENTER" if abs(result.deviation_m) < 0.1
+                          else "LEFT" if result.deviation_m > 0 else "RIGHT")
+                    stop_str = f"STOP@{result.stop_line_dist:.1f}m" if result.stop_line else "-"
+                    sign_str = f"SIGN@{result.stop_sign_dist_m:.2f}m" if result.stop_sign else "-"
+                    print(f"{fc:>6} | {result.source:>12} | "
+                          f"{result.deviation_m:>+8.3f} | {result.lane_width_m:>7.2f} | "
+                          f"{result.confidence:>5.0%} | {control_cmd:>8} | "
+                          f"{stop_str:<10} | {sign_str}")
+                else:
+                    sign_str = f"{result.stop_sign_dist_m:.2f}m" if result.stop_sign else "--"
+                    detected = "DETECTED" if result.stop_sign else "       -"
+                    print(f"{fc:>6} | {_fps_val:>6.1f} | {detected:>8} | "
+                          f"{sign_str:>8} | {control_cmd:>8}")
 
     finally:
         if logger:

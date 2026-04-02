@@ -13,7 +13,7 @@ CAM_FPS        = 30
 # NEURAL  = best depth quality, heaviest GPU load (~15-18 FPS real on Nano)
 # QUALITY = slightly noisier depth, ~2× faster — recommended for real-time
 # ULTRA   = fastest, noisiest — only if QUALITY still too slow
-CAM_DEPTH_MODE = sl.DEPTH_MODE.QUALITY
+CAM_DEPTH_MODE = sl.DEPTH_MODE.PERFORMANCE
 
 # ── Floor detection ────────────────────────────────────────────────────────────
 FLOOR_TOLERANCE      = 0.10     # ±m around floor plane (nominal)
@@ -50,7 +50,7 @@ STOP_VOTE_NEEDED    = 5         # consecutive frames before triggering
 
 # ── Polynomial lane fitting ────────────────────────────────────────────────────
 POLY_DEG         = 2            # quadratic — handles curves
-RANSAC_ITER      = 80
+RANSAC_ITER      = 40
 RANSAC_THRESH_PX = 6            # pixel residual for inlier test
 MIN_INLIERS      = 30
 MIN_PIXELS       = 40
@@ -84,6 +84,11 @@ LANE_MEM_MAX = 60               # rolling history length (frames × 5 samples)
 CONF_WHITE = 0.22
 CONF_GRASS = 0.22
 
+# ── Feature flags ─────────────────────────────────────────────────────────────
+# Set LANE_ENABLED = False to skip all floor/lane/obstacle/parking processing.
+# Only stop-sign detection + distance runs. Flip to True to re-enable everything.
+LANE_ENABLED = False
+
 # ── Stop-sign detection (YOLOv8) ──────────────────────────────────────────────
 # Train: python scripts/train_stop_sign.py --api-key YOUR_KEY
 # Export to TensorRT (run on Jetson): python scripts/export_trt.py
@@ -91,7 +96,7 @@ CONF_GRASS = 0.22
 #   class 0 = stop-sign          ← real sign, we want this
 #   class 1 = stop-sign-fake
 #   class 2 = stop-sign-vandalized  ← still a real stop sign
-SIGN_MODEL_PATH      = "weights/stop_sign.pt"   # swap to .engine after TRT export
+SIGN_MODEL_PATH      = "perception_stack/weights/stop_sign.pt"   # swap to .engine after TRT export
 SIGN_CONF_THRESH     = 0.60                      # YOLO confidence threshold (raised: FP16 quant noise + SEM-specific sign)
 SIGN_IMG_SIZE        = 416                       # inference resolution (faster on Nano)
 SIGN_ACCEPT_CLASSES  = {0, 2}                    # 0=stop-sign, 2=stop-sign-vandalized
@@ -206,6 +211,12 @@ PARK_DIST_MIN_M    = 0.5
 PARK_DIST_MAX_M    = 8.0
 PARK_VOTE_NEEDED   = 4        # temporal vote gate (frames)
 PARK_OBS_THRESHOLD = 30       # max ZED points > 0.2 m above floor → bay is occupied
+
+# ── Depth / point-cloud refresh ───────────────────────────────────────────────
+# Retrieve full XYZ point cloud at most every N frames.
+# Will refresh earlier if any detection vote gate is active.
+# Higher = faster pipeline, slightly stale distances between refreshes.
+PC_REFRESH_EVERY   = 4
 
 # ── FPS monitoring ─────────────────────────────────────────────────────────────
 FPS_WARN_BELOW     = 20.0     # print warning if rolling average FPS drops below this

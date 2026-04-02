@@ -35,7 +35,6 @@ from perception_stack.config import (
     SIGN_DIST_MIN_M,
     SIGN_DIST_MAX_M,
     SIGN_VOTE_NEEDED,
-    ROI_TOP_FRACTION,
     # SEM-specific hardening
     SIGN_YELLOW_H_MIN, SIGN_YELLOW_H_MAX,
     SIGN_YELLOW_S_MIN, SIGN_YELLOW_V_MIN,
@@ -60,9 +59,18 @@ class StopSignDetector:
         from ultralytics import YOLO
         self._model = YOLO(SIGN_MODEL_PATH)
 
-        # Warm-up: eliminate first-inference latency spike on Jetson
+        # Warm-up: try CUDA first, fall back to CPU on OOM
         _dummy = np.zeros((SIGN_IMG_SIZE, SIGN_IMG_SIZE, 3), dtype=np.uint8)
-        self._model.predict(_dummy, imgsz=SIGN_IMG_SIZE, verbose=False, device=0)
+        try:
+            self._model.predict(_dummy, imgsz=SIGN_IMG_SIZE, verbose=False, device=0, half=True)
+            self._device = 0
+            self._half   = True
+            print("[StopSign] Running on CUDA (FP16)")
+        except Exception as e:
+            print(f"[StopSign] CUDA unavailable ({e.__class__.__name__}), falling back to CPU")
+            self._model.predict(_dummy, imgsz=SIGN_IMG_SIZE, verbose=False, device="cpu")
+            self._device = "cpu"
+            self._half   = False
 
         # Thread-safe result store
         self._result: _Result = (False, 0.0, None)
@@ -144,7 +152,8 @@ class StopSignDetector:
             imgsz=SIGN_IMG_SIZE,
             conf=SIGN_CONF_THRESH,
             verbose=False,
-            device=0,
+            device=self._device,
+            half=self._half,
         )
 
         best_conf = -1.0
@@ -163,10 +172,6 @@ class StopSignDetector:
                 x1, y1, x2, y2 = map(int, box.xyxy[0])
                 cx = (x1 + x2) // 2
                 cy = (y1 + y2) // 2
-
-                # Exclude sky / hood region
-                if cy < int(H * ROI_TOP_FRACTION):
-                    continue
 
                 # Distance from point cloud — sample patch around centroid
                 r_patch = max(4, (y2 - y1) // 8)
