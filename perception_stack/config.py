@@ -87,7 +87,7 @@ CONF_GRASS = 0.22
 # ── Feature flags ─────────────────────────────────────────────────────────────
 # Set LANE_ENABLED = False to skip all floor/lane/obstacle/parking processing.
 # Only stop-sign detection + distance runs. Flip to True to re-enable everything.
-LANE_ENABLED = False
+LANE_ENABLED = True
 
 # ── Floor calibration ──────────────────────────────────────────────────────────
 # Run find_floor_plane() only during the first N frames to calibrate floor_y,
