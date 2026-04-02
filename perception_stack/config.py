@@ -8,11 +8,11 @@ import numpy as np
 import pyzed.sl as sl
 
 # ── Camera ─────────────────────────────────────────────────────────────────────
+# Hardware: Jetson Orin Nano 8GB Super + ZED 2i
 CAM_RES        = sl.RESOLUTION.HD720
 CAM_FPS        = 30
-# NEURAL  = best depth quality, heaviest GPU load (~15-18 FPS real on Nano)
-# QUALITY = slightly noisier depth, ~2× faster — recommended for real-time
-# ULTRA   = fastest, noisiest — only if QUALITY still too slow
+# PERFORMANCE = fast, low memory — appropriate for Orin Nano 8GB Super
+# NEURAL      = higher quality but heavier GPU load
 CAM_DEPTH_MODE = sl.DEPTH_MODE.PERFORMANCE
 
 # ── Floor detection ────────────────────────────────────────────────────────────
@@ -109,7 +109,7 @@ LANE_CURVE_THRESH       = 0.15  # |curvature| (m⁻¹) above which we run every 
 #   class 0 = stop-sign          ← real sign, we want this
 #   class 1 = stop-sign-fake
 #   class 2 = stop-sign-vandalized  ← still a real stop sign
-SIGN_MODEL_PATH      = "perception_stack/weights/stop_sign.pt"   # swap to .engine after TRT export
+SIGN_MODEL_PATH      = "perception_stack/weights/stop_sign.engine"  # TensorRT FP16 — built on this Jetson
 SIGN_CONF_THRESH     = 0.60                      # YOLO confidence threshold (raised: FP16 quant noise + SEM-specific sign)
 SIGN_IMG_SIZE        = 416                       # inference resolution (faster on Nano)
 SIGN_ACCEPT_CLASSES  = {0, 2}                    # 0=stop-sign, 2=stop-sign-vandalized
