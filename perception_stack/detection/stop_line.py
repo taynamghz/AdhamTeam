@@ -20,6 +20,7 @@ from perception_stack.config import (
     STOP_ORANGE_H_MIN, STOP_ORANGE_H_MAX, STOP_ORANGE_S_MIN, STOP_ORANGE_V_MIN,
     STOP_ROW_THRESH, STOP_COVERAGE_MIN, STOP_PERP_MAX_DEG,
     STOP_DIST_MIN_M, STOP_DIST_MAX_M, STOP_DIST_N_PTS, STOP_DIST_MIN_VALID,
+    STOP_WIDTH_MIN_FRAC,
 )
 from perception_stack.lane.fitting import eval_x
 
@@ -98,6 +99,22 @@ def detect_stop_line(
             coverage = int(orange[row, lx:rx].sum()) / lane_w
             if coverage < STOP_COVERAGE_MIN:
                 continue
+
+            # ── Physical stripe-width gate ────────────────────────────────────
+            # SEM stop line spans full track width (≥ 2 m).
+            # Measure lane width and stripe width from ZED X-coordinates.
+            # Rejects narrow orange fragments (cones, shadows, debris).
+            lp = pc[row, lx, :3]
+            rp = pc[row, rx, :3]
+            if np.isfinite(lp).all() and np.isfinite(rp).all():
+                lane_width_m = abs(float(rp[0] - lp[0]))
+                if lane_width_m > 0.3:
+                    stripe_width_m = _orange_stripe_width_m(
+                        orange, pc, row, lx, rx)
+                    if (stripe_width_m > 0 and
+                            stripe_width_m < STOP_WIDTH_MIN_FRAC * lane_width_m):
+                        continue
+
             dist = _stop_median_dist(pc, row, lx, rx, H, W)
             return True, row, dist
         else:
@@ -107,3 +124,29 @@ def detect_stop_line(
                 return True, row, dist
 
     return False, None, 0.0
+
+
+def _orange_stripe_width_m(
+    orange: np.ndarray,
+    pc: np.ndarray,
+    row: int,
+    lx: int,
+    rx: int,
+) -> float:
+    """
+    Measure the physical width (m) of the orange stripe at this row using
+    ZED X-coordinates of orange pixels between lx and rx.
+    Returns 0.0 if insufficient valid samples.
+    """
+    orange_cols = np.where(orange[row, lx:rx] > 0)[0] + lx
+    if orange_cols.size < 6:
+        return 0.0
+    # Sample every 4 px to stay fast
+    x_world = []
+    for col in orange_cols[::4]:
+        pt = pc[row, int(col), :3]
+        if np.isfinite(pt).all():
+            x_world.append(float(pt[0]))
+    if len(x_world) < 4:
+        return 0.0
+    return float(np.percentile(x_world, 90) - np.percentile(x_world, 10))

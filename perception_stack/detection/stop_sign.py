@@ -36,6 +36,11 @@ from perception_stack.config import (
     SIGN_DIST_MAX_M,
     SIGN_VOTE_NEEDED,
     ROI_TOP_FRACTION,
+    # SEM-specific hardening
+    SIGN_YELLOW_H_MIN, SIGN_YELLOW_H_MAX,
+    SIGN_YELLOW_S_MIN, SIGN_YELLOW_V_MIN,
+    SIGN_YELLOW_ROI_FRAC, SIGN_YELLOW_AREA_FRAC,
+    SIGN_FY_APPROX, SIGN_HEIGHT_M, SIGN_BBOX_MIN_FRAC,
 )
 
 _Result = Tuple[bool, float, Optional[Tuple[int, int, int, int]]]
@@ -177,9 +182,63 @@ class StopSignDetector:
                 if dist_m > 0 and not (SIGN_DIST_MIN_M <= dist_m <= SIGN_DIST_MAX_M):
                     continue
 
+                # ── Bbox height sanity check ──────────────────────────────────
+                # At distance dist_m, the sign should subtend approximately
+                # (SIGN_HEIGHT_M / dist_m) * SIGN_FY_APPROX pixels in height.
+                # Detections that are far too small for their reported depth
+                # are likely noise or unrelated objects.
+                if dist_m > 0:
+                    expected_h_px = (SIGN_HEIGHT_M / dist_m) * SIGN_FY_APPROX
+                    if (y2 - y1) < SIGN_BBOX_MIN_FRAC * expected_h_px:
+                        continue
+
+                # ── Yellow board secondary gate (SEM-specific) ────────────────
+                # The SEM stop sign sits on a yellow rectangular board.
+                # Check for yellow HSV region around the bbox.
+                # Hard-reject at conf < 0.72; advisory-only at higher confidence.
+                if not self._has_yellow_board(frame, x1, y1, x2, y2):
+                    if conf < 0.72:
+                        continue
+
                 if conf > best_conf:
                     best_conf = conf
                     best_bbox = (x1, y1, x2 - x1, y2 - y1)
                     best_dist = dist_m
 
         return (best_bbox is not None), best_dist, best_bbox
+
+    # ── Yellow board gate helper ───────────────────────────────────────────────
+
+    @staticmethod
+    def _has_yellow_board(
+        frame: np.ndarray,
+        x1: int, y1: int, x2: int, y2: int,
+    ) -> bool:
+        """
+        Check for a yellow (SEM board) HSV region around the predicted bbox.
+
+        Expands the bbox by SIGN_YELLOW_ROI_FRAC and measures what fraction
+        of that region falls in the yellow HSV range.  Returns True if the
+        fraction exceeds SIGN_YELLOW_AREA_FRAC.
+        """
+        import cv2 as _cv2
+        H_img, W_img = frame.shape[:2]
+        bw  = x2 - x1
+        bh  = y2 - y1
+        cx  = (x1 + x2) // 2
+        cy  = (y1 + y2) // 2
+        hw  = int(bw * SIGN_YELLOW_ROI_FRAC / 2)
+        hh  = int(bh * SIGN_YELLOW_ROI_FRAC / 2)
+        rx1 = max(0, cx - hw);  rx2 = min(W_img, cx + hw)
+        ry1 = max(0, cy - hh);  ry2 = min(H_img, cy + hh)
+        roi = frame[ry1:ry2, rx1:rx2]
+        if roi.size == 0:
+            return False
+        hsv_roi = _cv2.cvtColor(roi, _cv2.COLOR_BGR2HSV)
+        yellow  = _cv2.inRange(
+            hsv_roi,
+            (SIGN_YELLOW_H_MIN, SIGN_YELLOW_S_MIN, SIGN_YELLOW_V_MIN),
+            (SIGN_YELLOW_H_MAX, 255, 255),
+        )
+        area_frac = float(yellow.sum() // 255) / max(roi.shape[0] * roi.shape[1], 1)
+        return area_frac >= SIGN_YELLOW_AREA_FRAC

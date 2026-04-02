@@ -32,3 +32,12 @@ class PerceptionResult:
     curvature:          float = 0.0                              # κ = 1/R  (m⁻¹); signed
     lookahead_point:    Optional[Tuple[float,float]] = None      # (X_m, Z_m) world space
     lookahead_pixel:    Optional[Tuple[int,int]]     = None      # (x, y) image pixels
+    # Obstacle — blue SEM inflatable pin (detected above floor plane)
+    obstacle_detected:  bool  = False
+    obstacle_dist_m:    float = 0.0
+    obstacle_lateral_m: float = 0.0   # ZED X (m); positive = obstacle to the right
+    # Parking bay — blue floor markings
+    parking_detected:   bool  = False
+    parking_empty:      bool  = False  # True if no grey crates detected inside bay
+    parking_center_m:   Optional[Tuple[float, float]] = None    # (X_m, Z_m) bay centre
+    parking_angle_deg:  float = 0.0

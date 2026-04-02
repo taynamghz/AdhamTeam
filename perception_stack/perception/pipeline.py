@@ -11,6 +11,7 @@ Threading model:
 Call init() once, then process() every frame.
 """
 
+import collections
 import time
 import numpy as np
 import cv2
@@ -30,6 +31,11 @@ from perception_stack.config import (
     MIN_LANE_SEP_PX,
     LANE_SEP_MEM_FRAC,
     PROFILE_ENABLED, PROFILE_PRINT_EVERY,
+    # Phase 1–3 additions
+    CLAHE_CLIP_LIMIT, CLAHE_TILE_SIZE,
+    OBS_VOTE_NEEDED,
+    PARK_VOTE_NEEDED,
+    FPS_WARN_BELOW,
 )
 from perception_stack.models import PerceptionResult
 from perception_stack.lane.fitting import fit_lanes, eval_x
@@ -38,6 +44,8 @@ from perception_stack.lane.memory import LaneMemory
 from perception_stack.lane.deviation import compute_deviation
 from perception_stack.detection.stop_line import detect_stop_line
 from perception_stack.detection.stop_sign import StopSignDetector
+from perception_stack.detection.obstacle import detect_obstacle
+from perception_stack.detection.parking import detect_parking_bay
 from perception_stack.perception.warp import WarpTransform
 from perception_stack.lane.control import (
     compute_heading, compute_curvature, compute_lookahead, ControlSmoother,
@@ -84,6 +92,27 @@ class LanePerception:
 
         # Stop-sign detector — owns its own thread and vote gate
         self.sign_detector = StopSignDetector()
+
+        # CLAHE for lighting normalisation (applied once per frame before colour masking)
+        self._clahe = cv2.createCLAHE(
+            clipLimit=CLAHE_CLIP_LIMIT, tileGridSize=CLAHE_TILE_SIZE)
+
+        # ZED IMU sensor data handle
+        self._sensors_data = sl.SensorsData()
+
+        # Obstacle vote state
+        self._obs_votes:     int   = 0
+        self._last_obs_dist: float = 0.0
+        self._last_obs_lat:  float = 0.0
+
+        # Parking vote state
+        self._park_votes:       int   = 0
+        self._last_park_empty:  bool  = False
+        self._last_park_center        = None   # Optional[Tuple[float, float]]
+        self._last_park_angle:  float = 0.0
+
+        # Rolling frame-time buffer for FPS monitoring (last 30 frame timestamps)
+        self._frame_times: collections.deque = collections.deque(maxlen=30)
 
         # Profiling accumulators (ms, reset every PROFILE_PRINT_EVERY frames)
         self._prof: dict = {}
@@ -175,6 +204,35 @@ class LanePerception:
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
         return mask
 
+    # ── CLAHE normalisation ────────────────────────────────────────────────────
+
+    def _apply_clahe(self, frame: np.ndarray) -> np.ndarray:
+        """
+        Apply CLAHE to the L channel of LAB colour space.
+        Returns a normalised BGR frame with equalised luminance.
+        Invariant to auto-exposure changes, shadows, and sun/cloud transitions.
+        """
+        lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+        lab[:, :, 0] = self._clahe.apply(lab[:, :, 0])
+        return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+
+    # ── ZED IMU ────────────────────────────────────────────────────────────────
+
+    def _read_imu(self):
+        """
+        Pull pitch and roll from the ZED 2i IMU.
+        Returns (pitch_deg, roll_deg).  Falls back to (0.0, 0.0) on any error
+        so the rest of the pipeline continues unaffected if IMU is unavailable.
+        """
+        try:
+            self.cam.get_sensors_data(self._sensors_data, sl.TIME_REFERENCE.CURRENT)
+            imu    = self._sensors_data.get_imu_data()
+            pose   = imu.get_pose()
+            euler  = pose.get_euler_angles()   # [roll, pitch, yaw] in degrees
+            return float(euler[1]), float(euler[0])   # (pitch, roll)
+        except Exception:
+            return 0.0, 0.0
+
     # ── Colour pipeline ────────────────────────────────────────────────────────
 
     def _color_masks(self, frame: np.ndarray, fm: np.ndarray):
@@ -247,10 +305,17 @@ class LanePerception:
 
         self.cam.get_position(self.pose)
 
+        # ── CLAHE normalisation (lighting-invariant colour thresholding) ──────
+        frame_norm = self._apply_clahe(frame)
+
+        # ── ZED IMU: pitch/roll for tilt-compensated BEV ──────────────────────
+        pitch_deg, roll_deg = self._read_imu()
+
         if PROFILE_ENABLED: t = self._tick("grab+retrieve", t)
 
-        # ── Post frame to sign detector (non-blocking) ────────────────────────
-        self.sign_detector.submit(frame, pc, self.H, self.W)
+        # ── Post normalised frame to sign detector (non-blocking) ─────────────
+        # frame_norm improves yellow-board gate reliability in sign detector.
+        self.sign_detector.submit(frame_norm, pc, self.H, self.W)
 
         # ── Floor ─────────────────────────────────────────────────────────────
         if not self._update_floor():
@@ -259,8 +324,12 @@ class LanePerception:
         fm = self._floor_mask(pc)
         if PROFILE_ENABLED: t = self._tick("floor", t)
 
-        # ── Colour masks ──────────────────────────────────────────────────────
-        wm, gm, hls, hsv = self._color_masks(frame, fm)
+        # ── Tilt-compensated BEV update (IMU-driven, runs only when WARP is on) ─
+        if WARP_ENABLED and self.warp.M is not None:
+            self.warp.update_tilt(pitch_deg, roll_deg, self.W, self.H)
+
+        # ── Colour masks (on CLAHE-normalised frame) ──────────────────────────
+        wm, gm, hls, hsv = self._color_masks(frame_norm, fm)
         if PROFILE_ENABLED: t = self._tick("color_masks", t)
 
         # ── Lane fitting ──────────────────────────────────────────────────────
@@ -356,14 +425,48 @@ class LanePerception:
         if raw_stop and raw_y is not None:
             self._last_stop_y = raw_y
 
-        stop_confirmed = self._stop_votes >= STOP_VOTE_NEEDED
+        if PROFILE_ENABLED: t = self._tick("stop_line", t)
+
+        # ── Stop sign result (fast read from worker thread) ───────────────────
+        # Read here — before stop-line confirmation — so the prearmed flag can
+        # lower the stop-line voting threshold when a sign is confirmed at 3–8 m.
+        sign_confirmed, out_sign_dist, out_sign_bbox = self.sign_detector.get_result()
+
+        # ── Stop line confirmation with pre-arm ───────────────────────────────
+        # When the sign is confirmed nearby, lower the threshold so the stop line
+        # is confirmed faster (sign and line always appear together at SEM).
+        sign_prearmed        = sign_confirmed and 3.0 <= out_sign_dist <= 8.0
+        effective_stop_thresh = max(2, STOP_VOTE_NEEDED - (2 if sign_prearmed else 0))
+        stop_confirmed = self._stop_votes >= effective_stop_thresh
         out_y    = self._last_stop_y    if stop_confirmed else None
         out_dist = self._last_stop_dist if stop_confirmed else 0.0
 
-        if PROFILE_ENABLED: t = self._tick("stop_line", t)
+        # ── Obstacle detection ────────────────────────────────────────────────
+        raw_obs, raw_obs_dist, raw_obs_lat = detect_obstacle(
+            frame_norm, fm, lf, rf, pc, self.H, self.W, hsv)
 
-        # ── Stop sign (read result from sign worker thread) ───────────────────
-        sign_confirmed, out_sign_dist, out_sign_bbox = self.sign_detector.get_result()
+        MAX_OBS = OBS_VOTE_NEEDED + 3
+        self._obs_votes = (min(MAX_OBS, self._obs_votes + 1) if raw_obs
+                           else max(0, self._obs_votes - 1))
+        if raw_obs and raw_obs_dist > 0:
+            self._last_obs_dist = raw_obs_dist
+            self._last_obs_lat  = raw_obs_lat
+        obs_confirmed = self._obs_votes >= OBS_VOTE_NEEDED
+
+        # ── Parking bay detection ─────────────────────────────────────────────
+        raw_park, raw_park_empty, raw_park_center, raw_park_angle = detect_parking_bay(
+            frame_norm, fm, lf, rf, pc, self.H, self.W, hsv, self.floor_y)
+
+        MAX_PARK = PARK_VOTE_NEEDED + 3
+        self._park_votes = (min(MAX_PARK, self._park_votes + 1) if raw_park
+                            else max(0, self._park_votes - 1))
+        if raw_park:
+            self._last_park_empty  = raw_park_empty
+            self._last_park_center = raw_park_center
+            self._last_park_angle  = raw_park_angle
+        park_confirmed = self._park_votes >= PARK_VOTE_NEEDED
+
+        if PROFILE_ENABLED: t = self._tick("obstacle+parking", t)
 
         # ── Control outputs ───────────────────────────────────────────────────
         y_ctrl = int(self.H * CTRL_EVAL_Y_FRAC)
@@ -390,6 +493,16 @@ class LanePerception:
         if PROFILE_ENABLED and self.frame_cnt % PROFILE_PRINT_EVERY == 0:
             self._print_profile()
 
+        # ── FPS monitoring ────────────────────────────────────────────────────
+        now_t = time.perf_counter()
+        self._frame_times.append(now_t)
+        if len(self._frame_times) == self._frame_times.maxlen:
+            span = self._frame_times[-1] - self._frame_times[0]
+            if span > 0:
+                fps = (len(self._frame_times) - 1) / span
+                if fps < FPS_WARN_BELOW:
+                    print(f"[WARNING] FPS = {fps:.1f}  (target ≥ {FPS_WARN_BELOW:.0f})")
+
         return PerceptionResult(
             deviation_m        = dev,
             confidence         = min(0.99, (lc + rc) / 2.0),
@@ -411,6 +524,14 @@ class LanePerception:
             curvature          = curv_sm,
             lookahead_point    = lookahead_world,
             lookahead_pixel    = lookahead_px,
+            # Phase 1–3: obstacle + parking
+            obstacle_detected  = obs_confirmed,
+            obstacle_dist_m    = self._last_obs_dist if obs_confirmed else 0.0,
+            obstacle_lateral_m = self._last_obs_lat  if obs_confirmed else 0.0,
+            parking_detected   = park_confirmed,
+            parking_empty      = self._last_park_empty  if park_confirmed else False,
+            parking_center_m   = self._last_park_center if park_confirmed else None,
+            parking_angle_deg  = self._last_park_angle  if park_confirmed else 0.0,
         ), frame, fm, wm, gm
 
     def close(self):

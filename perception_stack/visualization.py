@@ -127,7 +127,7 @@ def draw(frame: np.ndarray, result: PerceptionResult,
     cs = ("CENTER" if abs(result.deviation_m) < thresh
           else "LEFT" if result.deviation_m > 0 else "RIGHT")
 
-    cv2.rectangle(vis, (0, 0), (W, 140), (0,0,0), -1)
+    cv2.rectangle(vis, (0, 0), (W, 188), (0,0,0), -1)
     cv2.putText(vis,
         f"Source:{result.source}{virt_tag}  Conf:{result.confidence:.0%}  "
         f"Width:{result.lane_width_m:.2f}m",
@@ -144,12 +144,36 @@ def draw(frame: np.ndarray, result: PerceptionResult,
                  if result.stop_sign else "No stop sign")
     cv2.putText(vis, sign_info, (10, 113), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
                 (0, 0, 200) if result.stop_sign else (80, 80, 80), 2)
+
+    # Obstacle row
+    if result.obstacle_detected:
+        side_str = "RIGHT" if result.obstacle_lateral_m > 0 else "LEFT"
+        obs_info = (f"OBSTACLE: {result.obstacle_dist_m:.1f}m  "
+                    f"lat={result.obstacle_lateral_m:+.2f}m ({side_str})")
+        obs_col  = (0, 165, 255)   # orange-ish warning
+    else:
+        obs_info = "No obstacle"
+        obs_col  = (80, 80, 80)
+    cv2.putText(vis, obs_info, (10, 136), cv2.FONT_HERSHEY_SIMPLEX, 0.6, obs_col, 2)
+
+    # Parking row
+    if result.parking_detected:
+        z_str    = (f"{result.parking_center_m[1]:.1f}m"
+                    if result.parking_center_m is not None else "--")
+        bay_str  = "EMPTY" if result.parking_empty else "OCCUPIED"
+        park_col = (0, 255, 0) if result.parking_empty else (0, 0, 255)
+        park_info = f"PARKING BAY: {z_str}  [{bay_str}]"
+    else:
+        park_info = "No parking bay"
+        park_col  = (80, 80, 80)
+    cv2.putText(vis, park_info, (10, 159), cv2.FONT_HERSHEY_SIMPLEX, 0.6, park_col, 2)
+
     # Control outputs row
-    lhd_str = (f"  LA:{result.lookahead_point[1]:.1f}m"
-               if result.lookahead_point is not None else "  LA:--")
+    lhd_str  = (f"  LA:{result.lookahead_point[1]:.1f}m"
+                if result.lookahead_point is not None else "  LA:--")
     ctrl_col = (0, 200, 255)
     cv2.putText(vis,
         f"Head:{np.degrees(result.heading_angle):+.1f}deg  "
-        f"Curv:{result.curvature:+.3f}m⁻¹{lhd_str}",
-        (10, 157), cv2.FONT_HERSHEY_SIMPLEX, 0.6, ctrl_col, 2)
+        f"Curv:{result.curvature:+.3f}m\u207b\u00b9{lhd_str}",
+        (10, 182), cv2.FONT_HERSHEY_SIMPLEX, 0.6, ctrl_col, 2)
     return vis

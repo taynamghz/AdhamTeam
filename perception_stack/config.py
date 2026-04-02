@@ -92,7 +92,7 @@ CONF_GRASS = 0.22
 #   class 1 = stop-sign-fake
 #   class 2 = stop-sign-vandalized  ← still a real stop sign
 SIGN_MODEL_PATH      = "weights/stop_sign.pt"   # swap to .engine after TRT export
-SIGN_CONF_THRESH     = 0.45                      # YOLO confidence threshold
+SIGN_CONF_THRESH     = 0.60                      # YOLO confidence threshold (raised: FP16 quant noise + SEM-specific sign)
 SIGN_IMG_SIZE        = 416                       # inference resolution (faster on Nano)
 SIGN_ACCEPT_CLASSES  = {0, 2}                    # 0=stop-sign, 2=stop-sign-vandalized
 SIGN_SKIP_FRAMES     = 3                         # run YOLO every N frames; cache between
@@ -143,3 +143,73 @@ DISPLAY = True
 # Prints per-step timing table every 30 frames to identify bottlenecks.
 PROFILE_ENABLED      = True
 PROFILE_PRINT_EVERY  = 30   # frames
+
+# ── CLAHE — lighting normalisation applied before all colour thresholds ─────────
+# Equalises the L channel (LAB space) so that auto-exposure shifts, shadows,
+# and overcast vs. direct-sun conditions don't collapse fixed HSV/HLS gates.
+CLAHE_CLIP_LIMIT  = 2.0
+CLAHE_TILE_SIZE   = (8, 8)    # (width, height) grid in tiles
+
+# ── ZED IMU tilt compensation ──────────────────────────────────────────────────
+# When the vehicle pitches or rolls, the fixed BEV homography becomes incorrect.
+# IMU data shifts the bottom warp source points to compensate.
+# Tune PITCH_BASELINE_DEG after mounting the camera in its final position.
+PITCH_BASELINE_DEG = 0.0      # camera pitch (deg) recorded during BEV calibration
+PITCH_PX_PER_DEG   = 8.0      # BEV source shift (px) per degree of pitch — tune on vehicle
+ROLL_PX_PER_DEG    = 3.0      # smaller lateral effect — tune on vehicle
+
+# ── Stop line — physical stripe-width gate ─────────────────────────────────────
+# SEM stop line spans full track width (≥ 2 m).
+# Reject orange detections that are narrower than this fraction of lane width —
+# eliminates orange cones, narrow debris, partial shadows.
+STOP_WIDTH_MIN_FRAC = 0.70    # stripe must be ≥ 70% of measured lane width
+
+# ── Stop sign — SEM-specific hardening ────────────────────────────────────────
+# The SEM stop sign is a red hexagon on a YELLOW BOARD.
+# A secondary yellow-HSV gate around the YOLO bbox rejects generic red objects.
+SIGN_YELLOW_H_MIN    = 18     # HSV hue range for SEM yellow board
+SIGN_YELLOW_H_MAX    = 38
+SIGN_YELLOW_S_MIN    = 120    # vivid yellow only — rejects faded paint
+SIGN_YELLOW_V_MIN    = 150
+SIGN_YELLOW_ROI_FRAC = 1.3    # expand bbox by this factor when sampling for yellow
+SIGN_YELLOW_AREA_FRAC = 0.12  # minimum yellow fraction in expanded roi
+# Bbox height sanity check: at distance d, sign should subtend ~(H_m/d)*fy pixels
+SIGN_FY_APPROX       = 730    # approx. vertical focal length at 720p (px)
+SIGN_HEIGHT_M        = 0.65   # assumed sign height (m) — midpoint of 0.5–1.0m spec
+SIGN_BBOX_MIN_FRAC   = 0.35   # bbox height must be ≥ this fraction of expected px height
+
+# ── Obstacle detection — SEM blue inflatable pin (ABOVE floor plane) ──────────
+# Pin spec: 1.10 m tall × 0.45 m diameter, blue.
+# Key: obstacle pixels are blue AND NOT on floor_mask.
+#      Parking pixels are blue AND ON floor_mask.  (same colour, different plane)
+OBS_BLUE_H_MIN     = 100      # HSV hue range — blue
+OBS_BLUE_H_MAX     = 135
+OBS_BLUE_S_MIN     = 80       # reject sky glare and pale blues
+OBS_BLUE_V_MIN     = 60
+OBS_MIN_PIXELS     = 150      # minimum connected-component area (px)
+OBS_ASPECT_MIN     = 1.2      # blob height/width ratio — pin is taller than wide
+OBS_HEIGHT_3D_MIN  = 0.3      # minimum 3D height span in world Y (m)
+OBS_HEIGHT_3D_MAX  = 1.5      # maximum 3D height span (m)
+OBS_DIST_MIN_M     = 0.4
+OBS_DIST_MAX_M     = 8.0
+OBS_VOTE_NEEDED    = 3        # temporal vote gate (frames)
+
+# ── Parking bay detection — blue floor markings (ON floor plane) ───────────────
+# Bay spec: 0.15 m-wide blue lines, white borders, 4 m × 2 m.
+# floor_mask separates these from the obstacle pin (same blue HSV range).
+PARK_BLUE_H_MIN    = 100
+PARK_BLUE_H_MAX    = 135
+PARK_BLUE_S_MIN    = 70
+PARK_BLUE_V_MIN    = 60
+PARK_MIN_PIXELS    = 400      # minimum floor-blue pixel count to consider a bay
+PARK_DIST_MIN_M    = 0.5
+PARK_DIST_MAX_M    = 8.0
+PARK_VOTE_NEEDED   = 4        # temporal vote gate (frames)
+PARK_OBS_THRESHOLD = 30       # max ZED points > 0.2 m above floor → bay is occupied
+
+# ── FPS monitoring ─────────────────────────────────────────────────────────────
+FPS_WARN_BELOW     = 20.0     # print warning if rolling average FPS drops below this
+
+# ── Telemetry logging ──────────────────────────────────────────────────────────
+LOG_TELEMETRY      = True
+LOG_DIR            = "logs"
