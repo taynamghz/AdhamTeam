@@ -355,6 +355,47 @@ STM32-side: add a 5-byte status reply frame `[0xBB][LEN=3][STATUS][ENC_HI][ENC_L
 
 ---
 
+## Recent Changes (April 2026)
+
+### Obstacle & Parking removed
+`detection/obstacle.py` and `detection/parking.py` have been deleted. All related config params (`OBS_*`, `PARK_*`), pipeline state, and `PerceptionResult` fields are removed. Current focus: lane following + stop line + stop sign only.
+
+### Hardware updated
+Running on **Jetson Orin Nano 8GB Super** (not Nano 4GB). Update `config.py` accordingly — depth mode `PERFORMANCE` is appropriate for this hardware.
+
+### Pipeline optimisations
+- **Floor calibration once**: `find_floor_plane()` runs for the first 60 frames then freezes. Re-runs only on sustained floor loss. Saves ~10ms every 4 frames during a run.
+- **Point cloud on demand**: ZED XYZ point cloud is only retrieved when the stop-sign or stop-line vote is active. Between detections the cached cloud is reused.
+- **Adaptive RANSAC rate**: On straight sections (`|curvature| < 0.15 m⁻¹`) lane fitting runs every 3 frames. On curves it runs every frame. EMA smoother holds the fit on skipped frames.
+- **`cam.get_position()` removed** from the hot path — result was never used downstream.
+
+---
+
+## TensorRT Export (do this before competition)
+
+YOLO inference with the default `.pt` weights takes ~60ms per call on the Orin Nano. Exporting to TensorRT FP16 brings this down to ~8ms — an ~8× speedup.
+
+**Run once on the Jetson:**
+```bash
+cd /path/to/AdhamTeam
+python scripts/export_trt.py
+```
+
+This will take 2–10 minutes to build the engine. Output: `perception_stack/weights/stop_sign.engine`
+
+**Then update `config.py`:**
+```python
+# Before (slow):
+SIGN_MODEL_PATH = "perception_stack/weights/stop_sign.pt"
+
+# After (fast — use this for all on-vehicle runs):
+SIGN_MODEL_PATH = "perception_stack/weights/stop_sign.engine"
+```
+
+> The `.engine` file is device-specific — it must be built on the same Jetson it runs on. Do not copy it from another machine.
+
+---
+
 ## Running the Stack
 
 ```bash

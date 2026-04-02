@@ -89,6 +89,19 @@ CONF_GRASS = 0.22
 # Only stop-sign detection + distance runs. Flip to True to re-enable everything.
 LANE_ENABLED = False
 
+# ── Floor calibration ──────────────────────────────────────────────────────────
+# Run find_floor_plane() only during the first N frames to calibrate floor_y,
+# then freeze it. The SEM track is flat — no need to re-estimate every 4 frames.
+# Only re-runs automatically if floor_miss_count reaches FLOOR_LOST_CONSEC.
+FLOOR_CALIBRATE_FRAMES = 60     # frames at startup to run floor estimation
+
+# ── Adaptive lane-fitting rate ─────────────────────────────────────────────────
+# On straight sections (curvature below threshold), skip RANSAC to save CPU.
+# On curves, run every frame.  Smoother EMA carries the fit between skipped frames.
+LANE_SKIP_STRAIGHT      = 3     # run RANSAC every N frames when road is straight
+LANE_CURVE_THRESH       = 0.15  # |curvature| (m⁻¹) above which we run every frame
+
+
 # ── Stop-sign detection (YOLOv8) ──────────────────────────────────────────────
 # Train: python scripts/train_stop_sign.py --api-key YOUR_KEY
 # Export to TensorRT (run on Jetson): python scripts/export_trt.py
@@ -183,34 +196,6 @@ SIGN_FY_APPROX       = 730    # approx. vertical focal length at 720p (px)
 SIGN_HEIGHT_M        = 0.65   # assumed sign height (m) — midpoint of 0.5–1.0m spec
 SIGN_BBOX_MIN_FRAC   = 0.35   # bbox height must be ≥ this fraction of expected px height
 
-# ── Obstacle detection — SEM blue inflatable pin (ABOVE floor plane) ──────────
-# Pin spec: 1.10 m tall × 0.45 m diameter, blue.
-# Key: obstacle pixels are blue AND NOT on floor_mask.
-#      Parking pixels are blue AND ON floor_mask.  (same colour, different plane)
-OBS_BLUE_H_MIN     = 100      # HSV hue range — blue
-OBS_BLUE_H_MAX     = 135
-OBS_BLUE_S_MIN     = 80       # reject sky glare and pale blues
-OBS_BLUE_V_MIN     = 60
-OBS_MIN_PIXELS     = 150      # minimum connected-component area (px)
-OBS_ASPECT_MIN     = 1.2      # blob height/width ratio — pin is taller than wide
-OBS_HEIGHT_3D_MIN  = 0.3      # minimum 3D height span in world Y (m)
-OBS_HEIGHT_3D_MAX  = 1.5      # maximum 3D height span (m)
-OBS_DIST_MIN_M     = 0.4
-OBS_DIST_MAX_M     = 8.0
-OBS_VOTE_NEEDED    = 3        # temporal vote gate (frames)
-
-# ── Parking bay detection — blue floor markings (ON floor plane) ───────────────
-# Bay spec: 0.15 m-wide blue lines, white borders, 4 m × 2 m.
-# floor_mask separates these from the obstacle pin (same blue HSV range).
-PARK_BLUE_H_MIN    = 100
-PARK_BLUE_H_MAX    = 135
-PARK_BLUE_S_MIN    = 70
-PARK_BLUE_V_MIN    = 60
-PARK_MIN_PIXELS    = 400      # minimum floor-blue pixel count to consider a bay
-PARK_DIST_MIN_M    = 0.5
-PARK_DIST_MAX_M    = 8.0
-PARK_VOTE_NEEDED   = 4        # temporal vote gate (frames)
-PARK_OBS_THRESHOLD = 30       # max ZED points > 0.2 m above floor → bay is occupied
 
 # ── Depth / point-cloud refresh ───────────────────────────────────────────────
 # Retrieve full XYZ point cloud at most every N frames.

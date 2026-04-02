@@ -35,7 +35,7 @@ class Commander:
 
     def __init__(self):
         self.uart   = UARTController()
-        self._state = "INIT"    # last commanded state for logging
+        self._state = "THROTTLE"    # last commanded state for logging
 
     # ── Lifecycle ───────────────────────────────────────────────────────────────
 

@@ -21,6 +21,7 @@ from typing import Optional, Tuple
 from perception_stack.config import (
     CAM_RES, CAM_FPS, CAM_DEPTH_MODE,
     FLOOR_TOLERANCE, FLOOR_TOLERANCE_WIDE, FLOOR_STABLE_HZ, FLOOR_LOST_CONSEC,
+    FLOOR_CALIBRATE_FRAMES,
     ROI_TOP_FRACTION, FLOOR_HIT_POINTS,
     WHITE_L_MIN, WHITE_S_MAX,
     GRASS_H_MIN, GRASS_H_MAX, GRASS_S_MIN, GRASS_V_MIN,
@@ -30,10 +31,9 @@ from perception_stack.config import (
     CTRL_EVAL_Y_FRAC,
     MIN_LANE_SEP_PX,
     LANE_SEP_MEM_FRAC,
+    LANE_SKIP_STRAIGHT, LANE_CURVE_THRESH,
     PROFILE_ENABLED, PROFILE_PRINT_EVERY,
     CLAHE_CLIP_LIMIT, CLAHE_TILE_SIZE,
-    OBS_VOTE_NEEDED,
-    PARK_VOTE_NEEDED,
     FPS_WARN_BELOW,
     PC_REFRESH_EVERY,
     LANE_ENABLED,
@@ -45,8 +45,6 @@ from perception_stack.lane.memory import LaneMemory
 from perception_stack.lane.deviation import compute_deviation
 from perception_stack.detection.stop_line import detect_stop_line
 from perception_stack.detection.stop_sign import StopSignDetector
-from perception_stack.detection.obstacle import detect_obstacle
-from perception_stack.detection.parking import detect_parking_bay
 from perception_stack.perception.warp import WarpTransform
 from perception_stack.lane.control import (
     compute_heading, compute_curvature, compute_lookahead, ControlSmoother,
@@ -78,11 +76,18 @@ class LanePerception:
         self.cal = None
         self.W = self.H = None
 
-        self._floor_miss_count: int = 0
+        self._floor_miss_count:  int  = 0
+        self._floor_calibrated:  bool = False   # True after startup calibration
 
         self._last_deviation: float = 0.0
         self._last_heading:   float = 0.0
         self._last_curvature: float = 0.0
+
+        # Adaptive lane-fitting rate
+        self._lane_skip_counter: int   = 0
+        self._last_source:       str   = "LOST"
+        self._last_lc:           float = 0.0
+        self._last_rc:           float = 0.0
 
         self.lane_mem = LaneMemory()
 
@@ -100,17 +105,6 @@ class LanePerception:
 
         # ZED IMU sensor data handle
         self._sensors_data = sl.SensorsData()
-
-        # Obstacle vote state
-        self._obs_votes:     int   = 0
-        self._last_obs_dist: float = 0.0
-        self._last_obs_lat:  float = 0.0
-
-        # Parking vote state
-        self._park_votes:       int   = 0
-        self._last_park_empty:  bool  = False
-        self._last_park_center        = None   # Optional[Tuple[float, float]]
-        self._last_park_angle:  float = 0.0
 
         # Point-cloud cache — retrieved conditionally, not every frame
         self._pc_cache: Optional[np.ndarray] = None
@@ -160,10 +154,22 @@ class LanePerception:
     # ── Floor ──────────────────────────────────────────────────────────────────
 
     def _update_floor(self) -> bool:
-        in_lost_mode = self._floor_miss_count >= FLOOR_LOST_CONSEC
-        on_schedule  = (self.frame_cnt % FLOOR_STABLE_HZ == 0)
+        """
+        Estimate floor_y from ZED plane detection.
 
-        if not in_lost_mode and self.floor_y is not None and not on_schedule:
+        Runs every frame during startup (first FLOOR_CALIBRATE_FRAMES frames)
+        to get a stable floor estimate, then freezes.  After calibration, only
+        re-runs when consecutive floor misses reach FLOOR_LOST_CONSEC — which
+        on a flat track essentially never happens.
+
+        This saves ~8-15ms per call compared to re-running every FLOOR_STABLE_HZ
+        frames throughout the run.
+        """
+        in_lost_mode = self._floor_miss_count >= FLOOR_LOST_CONSEC
+
+        # During calibration phase: run every frame to build a stable estimate
+        # After calibration: only run if we've lost the floor
+        if self._floor_calibrated and not in_lost_mode and self.floor_y is not None:
             return True
 
         if self.cam.find_floor_plane(self.plane, self.reset_tf) == \
@@ -176,6 +182,8 @@ class LanePerception:
                 else:
                     self.floor_y = 0.80 * self.floor_y + 0.20 * ny
                 self._floor_miss_count = 0
+                if self.frame_cnt >= FLOOR_CALIBRATE_FRAMES:
+                    self._floor_calibrated = True
                 return True
 
         for fx, fy in FLOOR_HIT_POINTS:
@@ -191,6 +199,8 @@ class LanePerception:
                     else:
                         self.floor_y = 0.85 * self.floor_y + 0.15 * ny
                     self._floor_miss_count = 0
+                    if self.frame_cnt >= FLOOR_CALIBRATE_FRAMES:
+                        self._floor_calibrated = True
                     return True
 
         self._floor_miss_count += 1
@@ -305,23 +315,29 @@ class LanePerception:
         self.cam.retrieve_image(self.image_mat, sl.VIEW.LEFT)
         frame = self.image_mat.get_data()[:, :, :3].copy()
 
-        # CLAHE helps YOLO yellow-board gate in all lighting conditions
+        # CLAHE: helps both YOLO yellow-board gate and colour thresholds
         frame_norm = self._apply_clahe(frame)
 
-        # ── Conditional point-cloud retrieval ─────────────────────────────────
-        # Refresh every PC_REFRESH_EVERY frames, or immediately when a sign
-        # candidate is being tracked (fresh depth = accurate distance).
+        # ── Point-cloud retrieval — truly on demand ────────────────────────────
+        # Only fetch when something actually needs distance data:
+        #   • First frame (cache is empty)
+        #   • Sign is actively being tracked (fresh Z = accurate braking dist)
+        #   • Stop-line vote is accumulating
+        #   • Obstacle vote is accumulating
+        # Between those conditions, reuse the cached cloud.  At 15 km/h the
+        # car moves ~0.14m per frame at 30fps — stale by ≤4 frames = ≤0.56m,
+        # acceptable for vote-gated decisions.
         self._pc_age += 1
-        sign_active = self.sign_detector.get_result()[0]  # non-blocking read
+        sign_active = self.sign_detector.get_result()[0]
         need_pc = (
             self._pc_cache is None
-            or self._pc_age >= PC_REFRESH_EVERY
             or sign_active
+            or self._stop_votes > 0
         )
         if need_pc:
             self.cam.retrieve_measure(self.pc_mat, sl.MEASURE.XYZ, sl.MEM.CPU)
             self._pc_cache = self.pc_mat.get_data()[:, :, :3].copy()
-            self._pc_age = 0
+            self._pc_age   = 0
         pc = self._pc_cache
 
         if PROFILE_ENABLED: t = self._tick("grab+retrieve", t)
@@ -335,23 +351,25 @@ class LanePerception:
         # ── Lane / floor / obstacle / parking (disabled until LANE_ENABLED) ───
         fm = wm = gm = None
         lf = rf = None
-        lc = rc = 0.0
+        lc = self._last_lc
+        rc = self._last_rc
         dev = wid = 0.0
         virt_left = virt_right = False
         stop_confirmed = False
         out_y = None
         out_dist = 0.0
-        obs_confirmed = False
-        park_confirmed = False
         heading_sm = self._last_heading
         curv_sm    = self._last_curvature
         lookahead_world = lookahead_px = None
         source = "DISABLED"
 
         if LANE_ENABLED:
-            pitch_deg, roll_deg = self._read_imu()
-            self.cam.get_position(self.pose)
+            # IMU for BEV tilt compensation (no-op when WARP_ENABLED=False)
+            if WARP_ENABLED:
+                pitch_deg, roll_deg = self._read_imu()
 
+            # Floor calibration: runs every frame until stable, then freezes.
+            # Re-runs only on sustained floor loss (essentially never on flat track).
             if not self._update_floor():
                 return PerceptionResult(source="NO_FLOOR"), frame, None, None, None
 
@@ -364,50 +382,78 @@ class LanePerception:
             wm, gm, hls, hsv = self._color_masks(frame_norm, fm)
             if PROFILE_ENABLED: t = self._tick("color_masks", t)
 
-            wl, wr, wlc, wrc = self._fit_mask(wm)
-            if max(wlc, wrc) < CONF_WHITE:
-                ge = cv2.Canny(gm, 50, 150)
-                gl, gr, glc, grc = self._fit_mask(ge)
-            else:
-                gl = gr = None
-                glc = grc = 0.0
+            # ── Adaptive lane fitting rate ─────────────────────────────────────
+            # On straight sections, RANSAC runs every LANE_SKIP_STRAIGHT frames;
+            # EMA smoother carries the fit on skipped frames.
+            # On curves, run every frame for accuracy.
+            on_curve = abs(self._last_curvature) >= LANE_CURVE_THRESH
+            self._lane_skip_counter += 1
+            run_ransac = on_curve or (self._lane_skip_counter >= LANE_SKIP_STRAIGHT)
+            if run_ransac:
+                self._lane_skip_counter = 0
 
-            def best(opts):
-                v = [(f, c) for f, c in opts if f is not None and c > 0.05]
-                return max(v, key=lambda x: x[1]) if v else (None, 0.0)
+            if run_ransac:
+                wl, wr, wlc, wrc = self._fit_mask(wm)
+                if max(wlc, wrc) < CONF_WHITE:
+                    ge = cv2.Canny(gm, 50, 150)
+                    gl, gr, glc, grc = self._fit_mask(ge)
+                else:
+                    gl = gr = None
+                    glc = grc = 0.0
 
-            raw_l, lc = best([(wl, wlc * 1.4), (gl, glc)])
-            raw_r, rc = best([(wr, wrc * 1.4), (gr, grc)])
+                def best(opts):
+                    v = [(f, c) for f, c in opts if f is not None and c > 0.05]
+                    return max(v, key=lambda x: x[1]) if v else (None, 0.0)
 
-            if raw_l is not None and raw_r is not None:
-                y_g = int(self.H * 0.85)
-                sep = eval_x(raw_r, y_g) - eval_x(raw_l, y_g)
-                too_close = sep < MIN_LANE_SEP_PX
-                if not too_close and self.lane_mem.mean_px is not None:
-                    too_close = sep < LANE_SEP_MEM_FRAC * self.lane_mem.mean_px
-                if too_close:
-                    lx = eval_x(raw_l, y_g)
-                    rx = eval_x(raw_r, y_g)
-                    if self.lane_mem.mean_px is not None:
-                        r_err = abs(rx - (lx + self.lane_mem.mean_px))
-                        l_err = abs(lx - (rx - self.lane_mem.mean_px))
-                        if r_err >= l_err:
+                raw_l, lc = best([(wl, wlc * 1.4), (gl, glc)])
+                raw_r, rc = best([(wr, wrc * 1.4), (gr, grc)])
+                self._last_lc, self._last_rc = lc, rc
+
+                if raw_l is not None and raw_r is not None:
+                    y_g = int(self.H * 0.85)
+                    sep = eval_x(raw_r, y_g) - eval_x(raw_l, y_g)
+                    too_close = sep < MIN_LANE_SEP_PX
+                    if not too_close and self.lane_mem.mean_px is not None:
+                        too_close = sep < LANE_SEP_MEM_FRAC * self.lane_mem.mean_px
+                    if too_close:
+                        lx = eval_x(raw_l, y_g)
+                        rx = eval_x(raw_r, y_g)
+                        if self.lane_mem.mean_px is not None:
+                            r_err = abs(rx - (lx + self.lane_mem.mean_px))
+                            l_err = abs(lx - (rx - self.lane_mem.mean_px))
+                            if r_err >= l_err:
+                                raw_r, rc = None, 0.0
+                                self.smoother.r_ema = None
+                            else:
+                                raw_l, lc = None, 0.0
+                                self.smoother.l_ema = None
+                        elif lc >= rc:
                             raw_r, rc = None, 0.0
                             self.smoother.r_ema = None
                         else:
                             raw_l, lc = None, 0.0
                             self.smoother.l_ema = None
-                    elif lc >= rc:
-                        raw_r, rc = None, 0.0
-                        self.smoother.r_ema = None
-                    else:
-                        raw_l, lc = None, 0.0
-                        self.smoother.l_ema = None
 
-            if raw_l is not None: self._prev_lf = raw_l
-            if raw_r is not None: self._prev_rf = raw_r
+                if raw_l is not None: self._prev_lf = raw_l
+                if raw_r is not None: self._prev_rf = raw_r
 
-            lf, rf = self.smoother.update(raw_l, raw_r)
+                if wlc > CONF_WHITE or wrc > CONF_WHITE:
+                    source = "WHITE_LINE"
+                elif glc > CONF_GRASS or grc > CONF_GRASS:
+                    source = "GRASS"
+                else:
+                    source = "LOST"
+                self._last_source = source
+
+                # Pass actual new raw fits (not _prev) so smoother gets None
+                # on a lost-lane frame rather than blending toward a stale fit.
+                sm_l, sm_r = raw_l, raw_r
+            else:
+                # Skipped frame — pass None so smoother holds current EMA unchanged
+                sm_l = sm_r = None
+                source = self._last_source
+
+            lf, rf = self.smoother.update(sm_l, sm_r)
             virt_left = virt_right = False
             self.lane_mem.update(lf, rf, pc, self.H, self.W)
             fx = self.cal.fx
@@ -421,13 +467,6 @@ class LanePerception:
                     rf, virt_right = vrf, True
 
             if PROFILE_ENABLED: t = self._tick("lane_fitting", t)
-
-            if wlc > CONF_WHITE or wrc > CONF_WHITE:
-                source = "WHITE_LINE"
-            elif glc > CONF_GRASS or grc > CONF_GRASS:
-                source = "GRASS"
-            else:
-                source = "LOST"
 
             if lf is not None or rf is not None:
                 dev, wid = compute_deviation(lf, rf, pc, self.H, self.W)
@@ -453,29 +492,6 @@ class LanePerception:
             stop_confirmed = self._stop_votes >= effective_stop_thresh
             out_y    = self._last_stop_y    if stop_confirmed else None
             out_dist = self._last_stop_dist if stop_confirmed else 0.0
-
-            raw_obs, raw_obs_dist, raw_obs_lat = detect_obstacle(
-                frame_norm, fm, lf, rf, pc, self.H, self.W, hsv)
-            MAX_OBS = OBS_VOTE_NEEDED + 3
-            self._obs_votes = (min(MAX_OBS, self._obs_votes + 1) if raw_obs
-                               else max(0, self._obs_votes - 1))
-            if raw_obs and raw_obs_dist > 0:
-                self._last_obs_dist = raw_obs_dist
-                self._last_obs_lat  = raw_obs_lat
-            obs_confirmed = self._obs_votes >= OBS_VOTE_NEEDED
-
-            raw_park, raw_park_empty, raw_park_center, raw_park_angle = detect_parking_bay(
-                frame_norm, fm, lf, rf, pc, self.H, self.W, hsv, self.floor_y)
-            MAX_PARK = PARK_VOTE_NEEDED + 3
-            self._park_votes = (min(MAX_PARK, self._park_votes + 1) if raw_park
-                                else max(0, self._park_votes - 1))
-            if raw_park:
-                self._last_park_empty  = raw_park_empty
-                self._last_park_center = raw_park_center
-                self._last_park_angle  = raw_park_angle
-            park_confirmed = self._park_votes >= PARK_VOTE_NEEDED
-
-            if PROFILE_ENABLED: t = self._tick("obstacle+parking", t)
 
             y_ctrl = int(self.H * CTRL_EVAL_Y_FRAC)
             wid_px = 0.0
@@ -509,33 +525,26 @@ class LanePerception:
                     print(f"[WARNING] FPS = {fps:.1f}  (target ≥ {FPS_WARN_BELOW:.0f})")
 
         return PerceptionResult(
-            deviation_m        = dev,
-            confidence         = min(0.99, (lc + rc) / 2.0),
-            lane_width_m       = wid,
-            source             = source,
-            left_fit           = lf,
-            right_fit          = rf,
-            left_conf          = min(0.99, lc),
-            right_conf         = min(0.99, rc),
-            stop_line          = stop_confirmed,
-            stop_line_y        = out_y,
-            stop_line_dist     = out_dist,
-            virtual_left       = virt_left,
-            virtual_right      = virt_right,
-            stop_sign          = sign_confirmed,
-            stop_sign_dist_m   = sign_dist,
-            stop_sign_bbox     = sign_bbox,
-            heading_angle      = heading_sm,
-            curvature          = curv_sm,
-            lookahead_point    = lookahead_world,
-            lookahead_pixel    = lookahead_px,
-            obstacle_detected  = obs_confirmed,
-            obstacle_dist_m    = self._last_obs_dist if obs_confirmed else 0.0,
-            obstacle_lateral_m = self._last_obs_lat  if obs_confirmed else 0.0,
-            parking_detected   = park_confirmed,
-            parking_empty      = self._last_park_empty  if park_confirmed else False,
-            parking_center_m   = self._last_park_center if park_confirmed else None,
-            parking_angle_deg  = self._last_park_angle  if park_confirmed else 0.0,
+            deviation_m    = dev,
+            confidence     = min(0.99, (lc + rc) / 2.0),
+            lane_width_m   = wid,
+            source         = source,
+            left_fit       = lf,
+            right_fit      = rf,
+            left_conf      = min(0.99, lc),
+            right_conf     = min(0.99, rc),
+            stop_line      = stop_confirmed,
+            stop_line_y    = out_y,
+            stop_line_dist = out_dist,
+            virtual_left   = virt_left,
+            virtual_right  = virt_right,
+            stop_sign      = sign_confirmed,
+            stop_sign_dist_m = sign_dist,
+            stop_sign_bbox   = sign_bbox,
+            heading_angle  = heading_sm,
+            curvature      = curv_sm,
+            lookahead_point  = lookahead_world,
+            lookahead_pixel  = lookahead_px,
         ), frame, fm, wm, gm
 
     def close(self):

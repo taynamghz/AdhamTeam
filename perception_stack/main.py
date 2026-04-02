@@ -45,11 +45,6 @@ class TelemetryLogger:
             'sl_dist':   round(result.stop_line_dist, 2),
             'stop_sign': result.stop_sign,
             'ss_dist':   round(result.stop_sign_dist_m, 2),
-            'obs':       result.obstacle_detected,
-            'obs_dist':  round(result.obstacle_dist_m,    2),
-            'obs_lat':   round(result.obstacle_lateral_m, 3),
-            'park':      result.parking_detected,
-            'park_ok':   result.parking_empty,
             'cmd':       cmd,
         }
         self._f.write(json.dumps(record) + '\n')
@@ -121,7 +116,6 @@ def main():
 
             if fc % 30 == 0:
                 if LANE_ENABLED:
-                    import math as _math
                     cs = ("CENTER" if abs(result.deviation_m) < 0.1
                           else "LEFT" if result.deviation_m > 0 else "RIGHT")
                     stop_str = f"STOP@{result.stop_line_dist:.1f}m" if result.stop_line else "-"
