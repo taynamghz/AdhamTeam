@@ -98,10 +98,12 @@ CTRL_EVAL_Y_FRAC     = 0.60  # image-row fraction to evaluate heading/curvature
 # 0   = full left  (-STEER_MAX_DEG)
 # 127 = straight   (0°)
 # 255 = full right (+STEER_MAX_DEG)
-STEER_MAX_DEG      = 25.0   # ±25° — hardware limit (right mechanically restricted)
-STEER_DEADBAND_DEG = 2.0    # ignore corrections smaller than this (mask noise)
-STEER_RATE_DEG     = 8.0    # max change per frame  (prevents sudden swerves)
-STEER_EMA_ALPHA    = 0.40   # EMA weight (higher = faster response, more jitter)
+STEER_MAX_DEG        = 25.0   # ±25° — hardware limit (right mechanically restricted)
+STEER_DEADBAND_DEG   = 2.0    # ignore corrections smaller than this (mask noise)
+STEER_RATE_DEG       = 5.0    # max change per frame  (prevents sudden swerves)
+STEER_EMA_ALPHA      = 0.25   # EMA weight — lower = smoother/slower response
+STEER_SEND_INTERVAL_S = 0.30  # min seconds between CMD_STEER UART transmissions
+                               # Nucleo steering PID needs time to settle each move
 
 # ── Display ────────────────────────────────────────────────────────────────────
 DISPLAY = True
@@ -140,7 +142,10 @@ SEG_SKIP_CURVE    = 1   # submit every frame on curves (full inference rate)
 # ── Segformer drivable-area lane detection ─────────────────────────────────────
 # Replaces RANSAC + colour-threshold lane fitting.
 # Works without white lane markings — detects asphalt / grass boundaries.
-SEG_MODEL_ID       = "nvidia/segformer-b2-finetuned-cityscapes-1024-1024"
+SEG_MODEL_ID       = "nvidia/segformer-b0-finetuned-cityscapes-512-512"
+# B0 @ 512×512: ~15ms on Jetson CUDA vs ~120ms for B2 @ 1024×1024
+# Accuracy is sufficient for drivable-area boundary detection at SEM speeds
+# Switch back to b2-1024-1024 only if boundary quality is insufficient
 SEG_ROAD_CLASSES   = [0]        # Cityscapes class 0 = road (drivable asphalt)
 SEG_ROI_TOP_FRAC   = 0.35       # ignore top fraction of frame (sky / hood)
 SEG_MIN_ROAD_FRAC  = 0.02       # min road fraction per row to count as valid boundary

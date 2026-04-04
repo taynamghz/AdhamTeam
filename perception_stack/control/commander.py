@@ -23,6 +23,7 @@ Anti-jitter stack for steering:
 """
 
 import math
+import time
 import logging
 
 from perception_stack.config import (
@@ -31,6 +32,7 @@ from perception_stack.config import (
     SPEED_TARGET_STRAIGHT_KMH, SPEED_TARGET_CURVE_KMH, SPEED_CURVE_THRESH,
     CTRL_LOOKAHEAD_M,
     STEER_MAX_DEG, STEER_DEADBAND_DEG, STEER_RATE_DEG, STEER_EMA_ALPHA,
+    STEER_SEND_INTERVAL_S,
 )
 from perception_stack.models import PerceptionResult
 from perception_stack.control.uart import UARTController
@@ -60,9 +62,10 @@ class Commander:
     def __init__(self):
         self.uart = UARTController()
 
-        self._state:      str   = "RUN"
-        self._last_steer: float = 0.0
-        self._steer_ema:  float = 0.0
+        self._state:        str   = "RUN"
+        self._last_steer:   float = 0.0
+        self._steer_ema:    float = 0.0
+        self._last_steer_t: float = 0.0   # time of last CMD_STEER transmission
 
         # Public state (for display / telemetry)
         self.target_kmh: float = SPEED_TARGET_STRAIGHT_KMH
@@ -109,8 +112,12 @@ class Commander:
                 self.uart.brake(BRAKE_VALUE)
             else:
                 self.uart.set_speed(target)
-            # Steering is always sent, independent of throttle/brake
-            self.uart.steer(_deg_to_steer_byte(steer))
+            # Rate-limit STEER: Nucleo motor PID needs time to settle each move.
+            # Only transmit if STEER_SEND_INTERVAL_S has elapsed since last send.
+            now = time.time()
+            if now - self._last_steer_t >= STEER_SEND_INTERVAL_S:
+                self.uart.steer(_deg_to_steer_byte(steer))
+                self._last_steer_t = now
 
         if state != self._state:
             log.info("[Commander] %s → %s  src=%s  spd=%.1f km/h  steer=%.1f deg",

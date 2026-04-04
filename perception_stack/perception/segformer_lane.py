@@ -245,7 +245,8 @@ class SegformerLane:
             rx = float(np.polyval(rf, y_near))
             cx_road  = (lx + rx) / 2.0
             cx_frame = W / 2.0
-            dev_px   = cx_frame - cx_road
+            # Positive deviation = lane centre RIGHT of frame centre = car drifted LEFT → steer right
+            dev_px   = cx_road - cx_frame
             wid_px   = max(rx - lx, 1.0)
             cx_col   = int(np.clip(cx_road, 0, W - 1))
             dev_m  = self._px_to_m(dev_px, y_near, cx_col, pc, fx)
