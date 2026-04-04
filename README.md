@@ -6,34 +6,37 @@
 
 ## Overview
 
-This repository contains the real-time autonomous perception stack for the PSU Eco Racing Shell Eco-Marathon vehicle. The system runs on a **Jetson Nano 4GB** with a **ZED 2i stereo camera** and communicates with an **STM32 Nucleo H743** low-level controller over a binary UART protocol.
+Real-time autonomous perception and control stack for the PSU Eco Racing Shell Eco-Marathon vehicle. Runs on a **Jetson Orin Nano 8GB Super** with a **ZED 2i stereo camera**, communicates with an **STM32 Nucleo H743** low-level controller over binary UART.
 
-The perception layer is the foundation of the autonomous stack. It is responsible for producing a clean, reliable `PerceptionResult` every camera frame — the single data contract that all future control layers (Pure Pursuit, mission state machine, parking maneuver) will consume.
+The stack detects the drivable area using **Segformer semantic segmentation**, computes steering via **Pure Pursuit**, and sends throttle/steer/brake setpoints to the Nucleo. The Nucleo runs its own PID — the Jetson only sends target values.
 
 ```
 ZED 2i Camera (720p, 30 FPS)
         │
         ▼
-  CLAHE Normalisation  ←── lighting invariance
+  CLAHE Normalisation        ← lighting invariance (LAB L-channel)
         │
-        ▼
-  Floor Plane (ZED SDK)  ←── ZED find_floor_plane() + IMU tilt compensation
+        ├──► SegformerLane (background thread)
+        │       Segformer-B2 cityscapes → road mask → boundary polynomials
+        │       → deviation_m, heading_angle, curvature
         │
-        ├──► Lane Detection  (HLS white + HSV grass → RANSAC poly → smoother → deviation)
+        ├──► StopSignDetector (background thread)
+        │       YOLOv8 → yellow-board gate → vote → confirmed sign + dist
         │
-        ├──► Stop Line       (orange HSV → PCA perp → width gate → temporal vote)
+        ├──► detect_stop_line()
+        │       orange HSV → row density → width gate → temporal vote
         │
-        ├──► Stop Sign       (YOLOv8n thread → yellow board gate → bbox sanity → vote)
-        │
-        ├──► Obstacle        (blue above-floor blob → aspect ratio → 3D height → vote)
-        │
-        └──► Parking Bay     (blue on-floor blob → orientation → empty check → vote)
+        └──► PerceptionResult
                 │
                 ▼
-         PerceptionResult  (dataclass — all outputs in one object)
+         Commander  (Pure Pursuit + anti-jitter stack)
                 │
                 ▼
-         Commander  →  UART  →  STM32 Nucleo H743
+         UART → STM32 Nucleo H743
+           CMD_STEER     → steering angle  (0=full-left, 127=centre, 255=full-right)
+           CMD_THROTTLE  → target speed    (byte = km/h × 10)
+           CMD_BRAKE     → emergency stop  (val = 255)
+           ← CMD_SPEED_REPORT ← actual speed from Nucleo (tenths of km/h)
 ```
 
 ---
@@ -42,35 +45,26 @@ ZED 2i Camera (720p, 30 FPS)
 
 ```
 perception_stack/
-├── main.py                   Entry point — main loop, telemetry logger, FPS monitor
-├── config.py                 All tunable parameters in one place (no magic numbers in code)
-├── models.py                 PerceptionResult dataclass — the output contract
-├── visualization.py          OpenCV debug overlay (lanes, stops, obstacle, parking, HUD)
+├── main.py                   Entry point — main loop, telemetry logger, display
+├── config.py                 All tunable parameters (no magic numbers in code)
+├── models.py                 PerceptionResult dataclass — single output contract
+├── visualization.py          OpenCV debug overlay (UART commands, lanes, HUD)
 │
 ├── perception/
 │   ├── pipeline.py           LanePerception — orchestrates every frame
-│   └── warp.py               Bird's-eye perspective warp with IMU tilt compensation
+│   └── segformer_lane.py     Segformer-B2 drivable-area detector (async thread)
 │
 ├── lane/
-│   ├── fitting.py            RANSAC + sliding window + prior-guided polynomial fitting
-│   ├── smoother.py           EMA smoother on lane polynomial coefficients
-│   ├── memory.py             Rolling lane-width history + virtual boundary projection
-│   ├── deviation.py          Metric lateral deviation from ZED point cloud
-│   └── control.py            Heading angle, curvature, lookahead point computation
+│   ├── fitting.py            eval_x() — polynomial evaluation helper
+│   └── control.py            heading angle, curvature, lookahead, ControlSmoother
 │
 ├── detection/
 │   ├── stop_line.py          Orange stripe detection with physical width validation
-│   ├── stop_sign.py          Threaded YOLOv8 with yellow-board gate (SEM-specific)
-│   ├── obstacle.py           Blue inflatable pin — above-floor detection + 3D height check
-│   └── parking.py            Blue floor markings + empty-space check via ZED depth
+│   └── stop_sign.py          Threaded YOLOv8 with yellow-board gate (SEM-specific)
 │
-├── control/
-│   ├── commander.py          High-level decision: THROTTLE / BRAKE / IDLE
-│   └── uart.py               5-byte binary framed protocol to STM32 with CRC-8
-│
-└── scripts/
-    ├── train_stop_sign.py    YOLOv8 fine-tuning script (Roboflow API)
-    └── export_trt.py         TensorRT FP16 export for Jetson deployment
+└── control/
+    ├── commander.py          Pure Pursuit + anti-jitter → UART setpoints every frame
+    └── uart.py               5-byte binary framed protocol to STM32 with CRC-8
 ```
 
 ---
@@ -78,361 +72,195 @@ perception_stack/
 ## How the Pipeline Works
 
 ### 1. CLAHE Normalisation
-Every frame is normalised before any colour processing:
+Every frame before any processing:
 ```
-BGR → LAB → CLAHE on L channel → LAB → BGR (frame_norm)
+BGR → LAB → CLAHE on L channel → LAB → BGR
 ```
-This makes all HSV/HLS thresholds invariant to auto-exposure changes, shadows, and the sun/cloud transitions common at outdoor Polish venues. `frame_norm` feeds every downstream colour gate.
+Makes colour thresholds invariant to auto-exposure, shadows, and outdoor lighting.
 
-### 2. Floor Plane Estimation
-`ZED.find_floor_plane()` locates the road surface each frame and gives its Y-coordinate in world space (`floor_y`). The floor mask is then a depth tolerance band (±10 cm nominal, ±28 cm in lost mode) applied to the ZED point cloud. Everything above this band is off-road or an obstacle.
+### 2. Drivable Area Detection (Segformer)
 
-**IMU tilt compensation** (`perception/warp.py → update_tilt()`): pitch and roll from the ZED 2i IMU dynamically shift the BEV perspective warp source points so that road camber and suspension travel don't skew the homography. Dead-band: ±0.5° (tunable).
+`SegformerLane` runs **nvidia/segformer-b2-finetuned-cityscapes-1024-1024** in a background thread. The main thread never blocks on inference.
 
-### 3. Lane Detection
-Two colour sources are tried in parallel:
-- **White lane lines** — HLS: L ≥ 160, S ≤ 65 (on floor pixels only)
-- **Grass boundary** — HSV: hue 25–95°, S ≥ 30, V ≥ 35 (Canny edge, on floor pixels)
+```
+frame → Segformer → semantic mask (class 0 = road/drivable)
+    → scan left  boundary each row → left polynomial  lf
+    → scan right boundary each row → right polynomial rf
+    → midpoint of lf + rf          → deviation_m  (lateral offset from centre)
+    → polynomial 1st derivative    → heading_angle
+    → polynomial 2nd derivative    → curvature κ (m⁻¹)
+```
 
-Both go through the same fitting pipeline:
-1. **Prior-guided search** (fast, when prior fit exists): search band = 50 px around last polynomial
-2. **Sliding window fallback** (12 windows, histogram-initialised base): runs on lane loss
-3. **RANSAC** polynomial fit (quadratic, 80 iterations, 6 px inlier threshold)
-4. **Contamination guard**: rejects fits that collapse the lane width below 70% of memory
-5. **EMA smoother** (α = 0.30) applied to polynomial coefficients
-6. **Lane memory**: when one boundary is missing, projects a virtual boundary using stored width + ZED depth (perspective-correct via focal length and Z)
+**Adaptive submission rate:**
 
-Metric lateral deviation is computed at 4 image rows (95%, 85%, 75%, 65% height), weighted by distance (closest row = 0.40 weight), using ZED X-coordinates for true metric output.
+| Condition | Segformer rate | Reason |
+|-----------|---------------|--------|
+| Straight `\|κ\| < 0.15` | ~6 Hz (1 in 5 frames) | Road shape barely changes; EMA carries the polynomial |
+| Curve `\|κ\| ≥ 0.15` | ~30 Hz (every frame) | Maximum freshness for steering accuracy |
 
-### 4. Stop Line Detection
+**Thread pattern:**
+- `submit()` — drops stale queued frame if worker busy (no inference lag accumulation)
+- `get_result()` — instant lock-read, always returns most recent completed result
+
+### 3. Stop Line Detection
 Six sequential gates (all must pass):
-1. Floor mask — only ground pixels
+1. Road mask — drivable-area pixels only
 2. Orange HSV — hue 5–20°, S ≥ 150, V ≥ 100
-3. Row density — ≥ 8% of frame width
-4. PCA perpendicularity — principal axis ≤ 20° from horizontal
-5. **Physical stripe width** — orange spans ≥ 70% of lane width (ZED X-coords). Rejects cones, debris, narrow shadows.
-6. Temporal voting — 5 consecutive frames (pre-arm: drops to 2 frames when stop sign confirmed at 3–8 m)
+3. Row density — ≥ 8% of frame width orange
+4. PCA perpendicularity — cluster within ±20° of horizontal
+5. Physical stripe width — orange spans ≥ 70% of lane width (rejects cones, debris)
+6. Temporal vote — 5 consecutive frames (drops to 3 if stop sign pre-armed at 3–8 m)
 
-### 5. Stop Sign Detection
-YOLOv8n runs in its own thread with a `maxsize=1` queue (stale frames dropped). Main thread never blocks.
-
-SEM-specific hardening applied to every YOLO prediction:
-- **Bbox height sanity**: at distance d m, expected height ≈ `(0.65 / d) × 730` px. Detections too small for their reported depth are rejected.
-- **Yellow board gate**: checks for yellow HSV region (hue 18–38°, S ≥ 120, V ≥ 150) in a 1.3× expanded bbox. Hard-required at confidence < 0.72; advisory above that.
-- Confidence threshold: **0.60** (raised from 0.45 for FP16 TensorRT stability)
+### 4. Stop Sign Detection (YOLOv8)
+Runs in its own thread. SEM-specific hardening on every detection:
+- **Yellow board gate** — checks for yellow HSV (hue 18–38°, S ≥ 120) in 1.3× expanded bbox
+- **Bbox height sanity** — expected height ≈ `(0.65m / dist) × 730px`; rejects too-small detections
+- Confidence threshold: 0.60
 - 3-frame temporal voting
 
-**⚠ CRITICAL — retraining required before competition:**
-The current model weights are trained on generic US stop signs. The SEM sign is a **red hexagon on a yellow rectangular board**. The yellow-board gate provides partial compensation but retraining on SEM-format images is mandatory for reliable recall. See `scripts/train_stop_sign.py`.
+### 5. Pure Pursuit Steering
 
-### 6. Obstacle Detection (`detection/obstacle.py`)
-Target: blue inflatable pin, 1.10 m × 0.45 m.
+Every frame:
+```
+steer_rad = atan(deviation_m / lookahead_m) − heading_angle
+```
+`deviation_m > 0` = vehicle left of centre → steer right.
+`heading_angle` = road direction feed-forward for curve anticipation.
 
-**Key insight**: the obstacle is blue AND above the floor. Parking markings are blue AND on the floor. `floor_mask` is the discriminator — no colour ambiguity.
+**Anti-jitter stack:**
+```
+Pure Pursuit
+    → clamp ±25°          (hardware limit — right side mechanically restricted)
+    → dead-band 2°        (suppress sub-noise corrections)
+    → rate-limit 8°/frame (single bad Segformer frame moves wheel ≤ 8°)
+    → EMA α=0.40          (~2–3 frame lag, eliminates high-frequency jitter)
+    → encode to 0–255 byte → CMD_STEER every frame
+```
 
-Pipeline:
-1. Blue HSV mask (hue 100–135°) on `above_floor = floor_mask < 128`
-2. ROI: skip top 35% (sky) and bottom 10% (hood)
-3. Morphological open+close to fill the inflatable surface
-4. Largest connected component ≥ 150 px
-5. Aspect ratio gate: blob height/width ≥ 1.2 (pin is taller than wide)
-6. ZED depth at centroid → `dist_m`
-7. **3D height check**: world Y span of blob top–bottom must be 0.3–1.5 m (eliminates spectator clothing, short debris)
-8. ZED X at centroid → `lateral_m` (positive = obstacle to the right)
-9. 3-frame temporal voting
+On `LOST` detection: steering decays 5%/frame toward straight (no snap-to-centre).
 
-Output in `PerceptionResult`: `obstacle_detected`, `obstacle_dist_m`, `obstacle_lateral_m`
+### 6. Speed Control
 
-### 7. Parking Bay Detection (`detection/parking.py`)
-Target: 4 m × 2 m bay with 0.15 m-wide blue boundary lines.
+| Condition | Target | Sent as |
+|-----------|--------|---------|
+| Straight `\|κ\| < 0.15` | 15.0 km/h | `CMD_THROTTLE byte=150` |
+| Curve `\|κ\| ≥ 0.15` | 10.0 km/h | `CMD_THROTTLE byte=100` |
+| Stop line/sign ≤ 1.0 m | BRAKE | `CMD_BRAKE byte=255` |
 
-**Key insight**: same blue HSV as the obstacle, but ON the floor (`floor_mask == 255`).
-
-Pipeline:
-1. Blue HSV mask on floor-plane pixels only
-2. Minimum 400 px gate
-3. Centroid of blue cluster → ZED 3D position `(X_m, Z_m)`
-4. PCA orientation → `angle_deg` (bay heading relative to camera)
-5. **Empty check**: counts ZED point-cloud returns > 0.2 m above `floor_y` in the bay volume. Grey crates (1.2 × 1.0 × 1.0 m) generate a dense above-floor cluster → `parking_empty = False`
-6. 4-frame temporal voting
-
-Output in `PerceptionResult`: `parking_detected`, `parking_empty`, `parking_center_m`, `parking_angle_deg`
+Nucleo PID handles all actuation. Jetson sends target only.
+Actual speed is received from Nucleo RX packets (`CMD_SPEED_REPORT`).
 
 ---
 
-## PerceptionResult — The Output Contract
+## UART Protocol
 
-Every frame the pipeline emits one `PerceptionResult` dataclass. This is the single interface between perception and all control layers. No control module ever touches the camera or raw sensor data.
+### TX — Jetson → Nucleo (5-byte frame)
+```
+[0xAA] [LEN=2] [CMD] [DATA] [CRC8/SMBUS]
+
+CMD_IDLE     = 0x00
+CMD_THROTTLE = 0x01   DATA = int(km/h × 10)   150 → 15.0 km/h
+CMD_BRAKE    = 0x02   DATA = 255
+CMD_STEER    = 0x03   DATA = 0–255  (0=full-left, 127=centre, 255=full-right)
+```
+Heartbeat retransmit every 80 ms keeps Nucleo 200 ms watchdog alive.
+
+### RX — Nucleo → Jetson (5-byte frame, background reader thread)
+```
+[0xBB] [0x02] [0x10] [DATA] [CRC8]
+DATA = speed in tenths of km/h  e.g. 153 → 15.3 km/h
+```
+
+---
+
+## PerceptionResult — Output Contract
 
 ```python
 @dataclass
 class PerceptionResult:
-    # Lane
-    deviation_m:       float          # lateral offset from centre (m); + = left of centre
-    confidence:        float          # 0–1 combined lane detection confidence
-    lane_width_m:      float          # metric lane width from ZED
-    source:            str            # "WHITE_LINE" / "GRASS" / "LOST" / "NO_FLOOR"
-    left_fit:          np.ndarray     # polynomial coefficients  x = a·y² + b·y + c
-    right_fit:         np.ndarray
-    left_conf:         float
-    right_conf:        float
-    virtual_left:      bool           # True if left boundary is synthesised from memory
-    virtual_right:     bool
-
-    # Stop line
-    stop_line:         bool
-    stop_line_dist:    float          # metres to stop line
-    stop_line_y:       int            # image row of stop line
-
-    # Stop sign
-    stop_sign:         bool
-    stop_sign_dist_m:  float
-    stop_sign_bbox:    tuple          # (x, y, w, h) pixels
-
-    # Control geometry (input to Pure Pursuit)
-    heading_angle:     float          # radians; θ = arctan(2a·y + b)
-    curvature:         float          # κ = 1/R  (m⁻¹); signed
-    lookahead_point:   tuple          # (X_m, Z_m) world-space lookahead on centreline
-    lookahead_pixel:   tuple          # (x, y) image pixel of lookahead point
-
-    # Obstacle
-    obstacle_detected:  bool
-    obstacle_dist_m:    float
-    obstacle_lateral_m: float         # ZED X (m); + = right, - = left
-
-    # Parking
-    parking_detected:   bool
-    parking_empty:      bool          # False if grey crates detected inside bay
-    parking_center_m:   tuple         # (X_m, Z_m) bay centre in world frame
-    parking_angle_deg:  float         # bay heading
+    deviation_m:        float       # lateral offset from centre (m); + = left of centre
+    confidence:         float       # 0–1 combined detection confidence
+    lane_width_m:       float       # metric lane width (m)
+    source:             str         # "SEGFORMER" / "SEG_PARTIAL" / "LOST" / "DISABLED"
+    left_fit:           np.ndarray  # quadratic poly  x = a·y² + b·y + c
+    right_fit:          np.ndarray
+    left_conf:          float
+    right_conf:         float
+    stop_line:          bool
+    stop_line_dist:     float       # metres to stop line (ZED point cloud)
+    stop_line_y:        int         # image row of stop line
+    stop_sign:          bool
+    stop_sign_dist_m:   float
+    stop_sign_bbox:     tuple       # (x, y, w, h) pixels
+    heading_angle:      float       # radians
+    curvature:          float       # κ (m⁻¹), signed
+    lookahead_point:    tuple       # (X_m, Z_m) world-space Pure Pursuit target
+    lookahead_pixel:    tuple       # (x, y) image pixel
+    speed_kmh:          float       # actual speed from Nucleo UART (filled by Commander)
 ```
 
 ---
 
 ## Configuration (`config.py`)
 
-All parameters in one file. Never hardcode values in algorithm files.
-
 | Section | Key parameters |
 |---------|---------------|
-| Camera | `CAM_RES`, `CAM_FPS`, `CAM_DEPTH_MODE` |
+| Camera | `CAM_RES=HD720`, `CAM_FPS=30`, `CAM_DEPTH_MODE=PERFORMANCE` |
 | CLAHE | `CLAHE_CLIP_LIMIT=2.0`, `CLAHE_TILE_SIZE=(8,8)` |
-| Floor | `FLOOR_TOLERANCE=0.10m`, `FLOOR_TOLERANCE_WIDE=0.28m` |
-| Lane colour | `WHITE_L_MIN=160`, `GRASS_H_MIN/MAX=25–95` |
-| Lane fitting | `RANSAC_ITER=80`, `WIN_MARGIN=60px`, `SMOOTH_ALPHA=0.30` |
+| Segformer | `SEG_MODEL_ID`, `SEG_ROAD_CLASSES=[0]`, `SEG_POLY_DEG=2` |
+| Adaptive rate | `SEG_SKIP_STRAIGHT=5`, `SEG_SKIP_CURVE=1` |
 | Stop line | `STOP_WIDTH_MIN_FRAC=0.70`, `STOP_VOTE_NEEDED=5` |
 | Stop sign | `SIGN_CONF_THRESH=0.60`, `SIGN_YELLOW_AREA_FRAC=0.12` |
-| Obstacle | `OBS_BLUE_H_MIN/MAX=100–135`, `OBS_ASPECT_MIN=1.2` |
-| Parking | `PARK_MIN_PIXELS=400`, `PARK_OBS_THRESHOLD=30` |
-| IMU warp | `PITCH_PX_PER_DEG=8.0` (tune on vehicle) |
-| UART | `UART_HEARTBEAT_S=0.080`, `THROTTLE_VALUE=189` |
-| BEV | `WARP_ENABLED=False` (enable after calibration) |
+| Steering | `STEER_MAX_DEG=25.0`, `STEER_DEADBAND_DEG=2.0`, `STEER_RATE_DEG=8.0`, `STEER_EMA_ALPHA=0.40` |
+| Speed | `SPEED_TARGET_STRAIGHT_KMH=15.0`, `SPEED_TARGET_CURVE_KMH=10.0`, `SPEED_CURVE_THRESH=0.15` |
+| Brake | `STOP_BRAKE_DIST_M=1.0`, `BRAKE_VALUE=255` |
+| Pure Pursuit | `CTRL_LOOKAHEAD_M=2.5`, `CTRL_EVAL_Y_FRAC=0.60` |
+| UART | `UART_PORT=/dev/ttyTHS1`, `UART_BAUD=115200`, `UART_HEARTBEAT_S=0.080` |
 
 ---
 
-## What Needs to Be Tested and Tuned Before Competition
-
-### On-Vehicle Hardware Tests (required before any driving)
-
-| # | Task | File / Config key | Notes |
-|---|------|-------------------|-------|
-| 1 | **BEV calibration** | `config.py → WARP_SRC/DST`, then set `WARP_ENABLED=True` | Place markers at 1m/2m/3m/4m ahead, record pixel coords, compute homography. Required before lane metrics are reliable. |
-| 2 | **IMU pitch baseline** | `config.py → PITCH_BASELINE_DEG` | Record the camera's resting pitch angle (ZED Euler Y) with car on flat ground. Set this value. |
-| 3 | **PITCH_PX_PER_DEG tuning** | `config.py → PITCH_PX_PER_DEG` | Drive over a small bump, watch BEV output. Adjust until lane lines stay parallel through the bump. |
-| 4 | **UART sanity** | `uart_test.py` | Verify STM32 echoes correctly, watchdog triggers at 200ms, all commands arrive intact. |
-| 5 | **ZED floor plane stability** | Run `pipeline.py`, watch `source` field | Should read `WHITE_LINE` or `GRASS`, not `NO_FLOOR`. Tune `FLOOR_TOLERANCE` if floor is lost. |
-
-### Colour Threshold Tuning (track conditions)
-
-| # | Task | Config key | Method |
-|---|------|------------|--------|
-| 6 | White lane threshold | `WHITE_L_MIN` | Lower in shadow (try 140), raise in glare (try 175). Check `wm` mask overlay in visualiser. |
-| 7 | Orange stop line HSV | `STOP_ORANGE_H_MIN/MAX`, `STOP_ORANGE_S_MIN` | Photograph the actual SEM orange line. Measure HSV range in that image. |
-| 8 | Blue obstacle range | `OBS_BLUE_H_MIN/MAX` | Hold the actual blue pin in front of the car at 3m. Tune until `obstacle_detected = True`. |
-| 9 | Blue parking range | `PARK_BLUE_H_MIN/MAX` | Tape blue lines on floor, drive past, tune until `parking_detected = True`. |
-
-### Stop Sign Retraining (critical before competition)
+## Running
 
 ```bash
-# Collect 100+ images of SEM red-hexagon-on-yellow-board sign
-# Annotate with LabelImg or Roboflow
-python scripts/train_stop_sign.py --api-key YOUR_ROBOFLOW_KEY
-python scripts/export_trt.py  # export to TensorRT FP16 for Jetson
-# Test: SIGN_CONF_THRESH=0.60, drive past sign at 5m → stop_sign=True within 3 frames
-```
-
-### Obstacle & Parking Bench Tests
-
-| # | Test | Pass condition |
-|---|------|---------------|
-| 10 | Blue balloon at 3m on asphalt | `obstacle_detected=True`, `obstacle_dist_m ≈ 3.0` within 3 frames |
-| 11 | Blue balloon to left of lane | `obstacle_lateral_m < 0` |
-| 12 | Tape blue rectangle on floor (parking mock) | `parking_detected=True`, `parking_empty=True` |
-| 13 | Place cardboard box inside blue rectangle | `parking_detected=True`, `parking_empty=False` |
-| 14 | Full stop: drive at orange tape line | `stop_line=True` at 3m, car stops before the line |
-
-### Performance Targets on Jetson Nano
-
-| Metric | Target | How to check |
-|--------|--------|-------------|
-| FPS | ≥ 25 | Profile print every 30 frames. `FPS_WARN_BELOW=20` triggers a console warning. |
-| Stop line detection latency | < 5 frames (167ms) at 30Hz | Count frames from first orange pixel to `stop_line=True` |
-| Obstacle vote confirmation | 3 frames (100ms) | Confirmed before obstacle is within 6m at 15 km/h |
-| UART round-trip | < 10ms | Measure ACK latency in `uart_test.py` |
-
----
-
-## Infrastructure for Future Control Steps
-
-The perception stack is deliberately decoupled from control. The `PerceptionResult` dataclass is the single handoff point. Every future control module reads from it without touching the camera, ZED SDK, or colour masks.
-
-### Pure Pursuit Steering (Phase 4 — ready to implement)
-
-All inputs are already computed and available in `PerceptionResult`:
-
-```python
-# These fields are computed every frame by lane/control.py:
-result.lookahead_point   # (X_m, Z_m) — the exact input Pure Pursuit needs
-result.heading_angle     # radians — fallback when lookahead is None
-result.curvature         # κ m⁻¹ — for speed governor
-result.deviation_m       # metres — for Kalman filter input
-
-# Pure Pursuit formula (implement in commander.py):
-alpha = atan2(X_m, Z_m)
-delta = atan(2 * WHEELBASE_M * sin(alpha) / sqrt(X_m² + Z_m²))
-steer_byte = clip(127 + round(delta / radians(30) * 127), 0, 255)
-```
-
-The `CMD_STEER` command code is already defined in `control/uart.py` (0x03). The `steer()` method and send-rate fix need to be added to `UARTController`.
-
-### Mission State Machine (Phase 4 — scaffolded)
-
-The commander currently handles THROTTLE/BRAKE/IDLE reactively. The required states map directly to `PerceptionResult` fields:
-
-| State | Trigger condition (from PerceptionResult) |
-|-------|------------------------------------------|
-| `LANE_FOLLOW` | Default — send STEER + THROTTLE |
-| `STOP_APPROACH` | `stop_line=True` AND `stop_line_dist < 3.0m` |
-| `FULL_STOP` | `stop_line_dist < 1.0m` → hold BRAKE for ~1.5s |
-| `PROCEED` | Timer elapsed → resume THROTTLE + STEER |
-| `OBSTACLE_AVOID` | `obstacle_detected=True` → shift `lookahead_point.X` by ±0.55m |
-| `SEEK_PARK` | `parking_detected=True AND parking_empty=True` → use `parking_center_m` as lateral target |
-| `PARKED` | Distance to `parking_center_m` < 0.5m → full BRAKE + IDLE |
-
-### Kalman Filter on Lateral Deviation (Phase 4)
-
-`deviation_m` already has a holdover mechanism (last known value used on `LOST` source). Replace with a proper 2-state Kalman:
-
-```
-State:       [deviation_m, lateral_velocity_mps]
-Measurement: [deviation_m]    from PerceptionResult
-Control:     [steering_angle]  predictive model
-```
-
-This runs in microseconds and handles 2–3 frame detection dropouts (shadow, worn marking) cleanly.
-
-### Speed Feedback via ZED Positional Tracking
-
-ZED positional tracking is already enabled (`enable_positional_tracking()`). Sequential pose differences give forward velocity:
-
-```python
-# In pipeline.py — extract speed from ZED VO:
-self.cam.get_position(self.pose)
-translation = self.pose.get_translation()
-# diff(translation.z) / dt → forward speed (m/s)
-```
-
-This gives ~30Hz speed estimate without IMU integration drift. Feed directly to Pure Pursuit for the correct `lookahead_distance = v * 0.5` scaling.
-
-### LLC Upgrade (Phase 4)
-
-Two changes needed in `control/uart.py`:
-
-1. **Remove STEER deduplication** — `send()` currently skips identical consecutive commands. STEER must be sent every frame (30 Hz).
-2. **Add `steer(value: int)` method** — identical pattern to existing `throttle()` and `brake()`.
-
-STM32-side: add a 5-byte status reply frame `[0xBB][LEN=3][STATUS][ENC_HI][ENC_LO][CRC8]` so the Jetson can monitor watchdog health and clutch state without polling.
-
----
-
-## Recent Changes (April 2026)
-
-### Obstacle & Parking removed
-`detection/obstacle.py` and `detection/parking.py` have been deleted. All related config params (`OBS_*`, `PARK_*`), pipeline state, and `PerceptionResult` fields are removed. Current focus: lane following + stop line + stop sign only.
-
-### Hardware updated
-Running on **Jetson Orin Nano 8GB Super** (not Nano 4GB). Update `config.py` accordingly — depth mode `PERFORMANCE` is appropriate for this hardware.
-
-### Pipeline optimisations
-- **Floor calibration once**: `find_floor_plane()` runs for the first 60 frames then freezes. Re-runs only on sustained floor loss. Saves ~10ms every 4 frames during a run.
-- **Point cloud on demand**: ZED XYZ point cloud is only retrieved when the stop-sign or stop-line vote is active. Between detections the cached cloud is reused.
-- **Adaptive RANSAC rate**: On straight sections (`|curvature| < 0.15 m⁻¹`) lane fitting runs every 3 frames. On curves it runs every frame. EMA smoother holds the fit on skipped frames.
-- **`cam.get_position()` removed** from the hot path — result was never used downstream.
-
----
-
-## TensorRT Export (do this before competition)
-
-YOLO inference with the default `.pt` weights takes ~60ms per call on the Orin Nano. Exporting to TensorRT FP16 brings this down to ~8ms — an ~8× speedup.
-
-**Run once on the Jetson:**
-```bash
-cd /path/to/AdhamTeam
-python scripts/export_trt.py
-```
-
-This will take 2–10 minutes to build the engine. Output: `perception_stack/weights/stop_sign.engine`
-
-**Then update `config.py`:**
-```python
-# Before (slow):
-SIGN_MODEL_PATH = "perception_stack/weights/stop_sign.pt"
-
-# After (fast — use this for all on-vehicle runs):
-SIGN_MODEL_PATH = "perception_stack/weights/stop_sign.engine"
-```
-
-> The `.engine` file is device-specific — it must be built on the same Jetson it runs on. Do not copy it from another machine.
-
----
-
-## Running the Stack
-
-```bash
-# On Jetson Nano — requires ZED SDK, ultralytics, pyserial
+# On Jetson — requires ZED SDK, transformers, ultralytics, pyserial
 cd /path/to/AdhamTeam
 python -m perception_stack.main
 
-# Dry run (no UART / no STM32 needed):
+# Dry run (no UART / no STM32):
 # Set UART_ENABLED = False in config.py
 
-# Display off (SSH / headless):
+# Headless / SSH:
 # Set DISPLAY = False in config.py
-
-# Telemetry replay:
-cat logs/run_*.jsonl | python -c "
-import sys, json
-for line in sys.stdin:
-    r = json.loads(line)
-    if r['obs']: print(f\"t={r['t']:.1f}s  OBS {r['obs_dist']}m lat={r['obs_lat']}\")
-"
 ```
 
 ---
 
-## Competition Checklist
+## Before First Drive — Checklist
 
-- [ ] BEV homography calibrated and `WARP_ENABLED = True`
-- [ ] `PITCH_BASELINE_DEG` set from vehicle IMU reading
-- [ ] Orange stop line HSV verified on actual SEM markings
-- [ ] Blue obstacle HSV verified on actual SEM pin
-- [ ] YOLO retrained on SEM yellow-board sign → weights in `weights/stop_sign.engine`
-- [ ] `SIGN_CONF_THRESH = 0.60` confirmed (do not lower below 0.55)
-- [ ] Full stop at orange line: stops before line, within 2 car lengths
-- [ ] Obstacle detection: `obstacle_detected=True` at 6m, `lateral_m` correct side
-- [ ] Parking bay detection: `parking_empty` correctly reports crate presence
-- [ ] Telemetry log created at start of each run (`LOG_TELEMETRY = True`)
-- [ ] FPS ≥ 25 on Jetson Nano at QUALITY depth mode
+| # | Task | Notes |
+|---|------|-------|
+| 1 | YOLO weights at `perception_stack/weights/stop_sign.pt` | Or `.engine` after TRT export |
+| 2 | UART loopback test | Verify Nucleo sends `CMD_SPEED_REPORT` at 115200 |
+| 3 | Orange stop line HSV verified | Photograph actual SEM orange tape, check hue 5–20° |
+| 4 | `STOP_BRAKE_DIST_M` tuned | Default 1.0 m — adjust to vehicle braking distance |
+| 5 | Steering centre confirmed | Byte 127 → straight driving on actual car |
+| 6 | Segformer warmup | First inference ~2–3 s (model load); pipeline returns LOST until ready |
+
+### Stop Sign Retraining (required before competition)
+```bash
+# Current weights: generic US stop signs.
+# SEM sign: red hexagon on yellow rectangular board.
+python scripts/train_stop_sign.py --api-key YOUR_ROBOFLOW_KEY
+python scripts/export_trt.py
+# Then: SIGN_MODEL_PATH = "perception_stack/weights/stop_sign.engine"
+```
+
+### TensorRT Export (run on Jetson before competition)
+```bash
+python scripts/export_trt.py
+# YOLO: ~60ms → ~8ms on Orin Nano
+# Engine is device-specific — build on the deployment Jetson
+```
 
 ---
 
@@ -440,12 +268,12 @@ for line in sys.stdin:
 
 | Component | Spec |
 |-----------|------|
-| Compute | Jetson Nano 4GB |
+| Compute | Jetson Orin Nano 8GB Super |
 | Camera | ZED 2i — 720p, 30 FPS, stereo depth, IMU |
-| Blind spot | MB7062 ultrasonic (0–1m, ZED min range fill) |
 | LLC | STM32 Nucleo H743 |
 | Drive | D5BLD750-48A-30S + PLF090-10 gearbox (750W, 300 RPM) |
 | Steering | NEMA23 + EG23 gearbox (50:1) + CL57T-V41 closed-loop driver |
+| Steering range | −25° to +25° (right side mechanically limited; physical centre = −10°) |
 | EM Clutch | DLD6-20B 24V 20Nm (fail-safe manual override) |
 | Brake | 2× 35kg.cm servo (dual redundant) |
 | UART | `/dev/ttyTHS1`, 115200 baud, 5-byte framed, CRC-8/SMBUS |

@@ -4,7 +4,6 @@ config.py  |  All tunable parameters in one place.
 Edit this file to tune thresholds without touching algorithm logic.
 """
 
-import numpy as np
 import pyzed.sl as sl
 
 # ── Camera ─────────────────────────────────────────────────────────────────────
@@ -15,197 +14,138 @@ CAM_FPS        = 30
 # NEURAL      = higher quality but heavier GPU load
 CAM_DEPTH_MODE = sl.DEPTH_MODE.PERFORMANCE
 
-# ── Floor detection ────────────────────────────────────────────────────────────
-FLOOR_TOLERANCE      = 0.10     # ±m around floor plane (nominal)
-FLOOR_TOLERANCE_WIDE = 0.28     # wider band when uncertain — keeps lane mask alive
-FLOOR_STABLE_HZ      = 4        # re-run find_floor_plane every N frames when stable
-FLOOR_LOST_CONSEC    = 3        # after N consecutive failures → aggressive mode
-ROI_TOP_FRACTION     = 0.35     # ignore top 35% of frame (sky / hood)
-# Hit-test fallback grid: (frac_x, frac_y) of frame — bottom-centre first
-FLOOR_HIT_POINTS = [(0.50, 0.75), (0.35, 0.80), (0.65, 0.80),
-                    (0.50, 0.88), (0.35, 0.88), (0.65, 0.88)]
+# ── Region of interest ─────────────────────────────────────────────────────────
+# Fraction of frame height to ignore from the top (sky, bonnet).
+# Used by: Segformer floor-mask cutoff, lane/control lookahead scan.
+ROI_TOP_FRACTION = 0.35
 
-# ── White lane line  (HLS) ─────────────────────────────────────────────────────
-WHITE_L_MIN = 160               # lower slightly for shadowed asphalt
-WHITE_S_MAX = 65
-
-# ── Grass / asphalt boundary  (HSV) ───────────────────────────────────────────
-GRASS_H_MIN, GRASS_H_MAX = 25, 95
-GRASS_S_MIN = 30
-GRASS_V_MIN = 35
-
-# ── Stop-line (orange horizontal stripe, floor pixels only) ───────────────────
+# ── Stop-line (orange horizontal stripe painted on road) ──────────────────────
 STOP_ORANGE_H_MIN   = 5         # HSV hue lower  (orange)
 STOP_ORANGE_H_MAX   = 20        # HSV hue upper  (orange)
 STOP_ORANGE_S_MIN   = 150       # vivid orange only
-STOP_ORANGE_V_MIN   = 100       # reject dark/shadowed patches
+STOP_ORANGE_V_MIN   = 100       # reject dark / shadowed patches
 STOP_ROW_THRESH     = 0.08      # fraction of row width that must be orange
 STOP_COVERAGE_MIN   = 0.60      # fraction of lane interior that must be lit
 STOP_PERP_MAX_DEG   = 20.0      # cluster must be within ±20° of horizontal
 STOP_DIST_MIN_M     = 0.3
 STOP_DIST_MAX_M     = 10.0
 STOP_DIST_N_PTS     = 10        # sample points for median distance
-STOP_DIST_MIN_VALID = 4         # min valid samples needed
-STOP_VOTE_NEEDED    = 5         # consecutive frames before triggering
+STOP_DIST_MIN_VALID = 4         # min valid ZED samples required
+STOP_VOTE_NEEDED    = 5         # consecutive positive frames before triggering
 
-# ── Polynomial lane fitting ────────────────────────────────────────────────────
-POLY_DEG         = 2            # quadratic — handles curves
-RANSAC_ITER      = 40
-RANSAC_THRESH_PX = 6            # pixel residual for inlier test
-MIN_INLIERS      = 30
-MIN_PIXELS       = 40
-
-# Sliding-window (initial search / lost-lane recovery)
-N_WINDOWS  = 12
-WIN_MARGIN = 60                 # px half-width per window
-WIN_MINPIX = 25                 # min pixels to re-centre window
-
-# Prior-guided search (fast path when previous fit exists)
-PRIOR_MARGIN = 50               # px band around previous polynomial
-
-# ── Temporal smoothing ─────────────────────────────────────────────────────────
-SMOOTH_ALPHA = 0.30             # lower = smoother, higher = more responsive
-
-# ── Lane geometry sanity ───────────────────────────────────────────────────────
-LANE_WIDTH_MIN   = 0.20
-LANE_WIDTH_MAX   = 12.0
-# Absolute pixel floor for lf/rf separation (protects the first frames before
-# lane memory has built up — prevents degenerate same-feature fits).
-MIN_LANE_SEP_PX  = 40
-# Memory-relative width gate: if the raw fit separation is less than this
-# fraction of the remembered lane width, one fit is contaminated (e.g. by an
-# obstacle edge).  The drifting fit is discarded; lane memory fills the gap.
-LANE_SEP_MEM_FRAC = 0.70
-
-# ── Lane memory (virtual boundary on single-side turns) ────────────────────────
-LANE_MEM_MAX = 60               # rolling history length (frames × 5 samples)
-
-# ── Confidence gates (per source) ──────────────────────────────────────────────
-CONF_WHITE = 0.22
-CONF_GRASS = 0.22
+# ── Stop line — physical stripe-width gate ─────────────────────────────────────
+# Reject orange detections narrower than this fraction of the measured lane width.
+# SEM stop stripe spans full track width (≥ 2 m); cones and debris are narrower.
+STOP_WIDTH_MIN_FRAC = 0.70
 
 # ── Feature flags ─────────────────────────────────────────────────────────────
-# Set LANE_ENABLED = False to skip all floor/lane/obstacle/parking processing.
-# Only stop-sign detection + distance runs. Flip to True to re-enable everything.
+# False → skip Segformer, stop-line, and control outputs; only stop-sign runs.
 LANE_ENABLED = True
 
-# ── Floor calibration ──────────────────────────────────────────────────────────
-# Run find_floor_plane() only during the first N frames to calibrate floor_y,
-# then freeze it. The SEM track is flat — no need to re-estimate every 4 frames.
-# Only re-runs automatically if floor_miss_count reaches FLOOR_LOST_CONSEC.
-FLOOR_CALIBRATE_FRAMES = 60     # frames at startup to run floor estimation
-
-# ── Adaptive lane-fitting rate ─────────────────────────────────────────────────
-# On straight sections (curvature below threshold), skip RANSAC to save CPU.
-# On curves, run every frame.  Smoother EMA carries the fit between skipped frames.
-LANE_SKIP_STRAIGHT      = 3     # run RANSAC every N frames when road is straight
-LANE_CURVE_THRESH       = 0.15  # |curvature| (m⁻¹) above which we run every frame
-
-
 # ── Stop-sign detection (YOLOv8) ──────────────────────────────────────────────
-# Train: python scripts/train_stop_sign.py --api-key YOUR_KEY
-# Export to TensorRT (run on Jetson): python scripts/export_trt.py
-# Roboflow dataset: universe.roboflow.com/yolo-ifyjn/stop-sign-detection-1
-#   class 0 = stop-sign          ← real sign, we want this
-#   class 1 = stop-sign-fake
-#   class 2 = stop-sign-vandalized  ← still a real stop sign
+# Train:  python scripts/train_stop_sign.py --api-key YOUR_KEY
+# Export: python scripts/export_trt.py  (TensorRT FP16 for Jetson)
+# Use .engine path after export; .pt works for development without TRT
 SIGN_MODEL_PATH      = "perception_stack/weights/stop_sign.engine"  # TensorRT FP16 — built on this Jetson
-SIGN_CONF_THRESH     = 0.60                      # YOLO confidence threshold (raised: FP16 quant noise + SEM-specific sign)
-SIGN_IMG_SIZE        = 416                       # inference resolution (faster on Nano)
-SIGN_ACCEPT_CLASSES  = {0, 2}                    # 0=stop-sign, 2=stop-sign-vandalized
-SIGN_SKIP_FRAMES     = 3                         # run YOLO every N frames; cache between
-# Distance gate
+SIGN_CONF_THRESH     = 0.60
+SIGN_IMG_SIZE        = 416
+SIGN_ACCEPT_CLASSES  = {0, 2}    # 0=stop-sign  2=stop-sign-vandalized
+SIGN_SKIP_FRAMES     = 3         # run YOLO every N frames; cache between
 SIGN_DIST_MIN_M      = 0.5
 SIGN_DIST_MAX_M      = 15.0
-# Temporal vote gate (frames) — avoids single-frame false positives
-SIGN_VOTE_NEEDED     = 3
-
-# ── Bird's-eye warp ────────────────────────────────────────────────────────────
-# Set WARP_ENABLED=True once you have measured SRC corners on your track.
-# SRC = road trapezoid in camera image (fractions of W, H).
-# DST = rectangle in bird's-eye output  (fractions of W, H).
-WARP_ENABLED = False
-WARP_SRC = np.float32([[0.40, 0.55], [0.60, 0.55],
-                        [0.85, 0.95], [0.15, 0.95]])
-WARP_DST = np.float32([[0.20, 0.05], [0.80, 0.05],
-                        [0.80, 0.95], [0.20, 0.95]])
+SIGN_VOTE_NEEDED     = 3         # consecutive detections before confirming
+# SEM-specific: sign sits on a yellow rectangular board
+SIGN_YELLOW_H_MIN    = 18        # HSV hue range for SEM yellow board
+SIGN_YELLOW_H_MAX    = 38
+SIGN_YELLOW_S_MIN    = 120
+SIGN_YELLOW_V_MIN    = 150
+SIGN_YELLOW_ROI_FRAC  = 1.3      # expand bbox by this factor when sampling yellow
+SIGN_YELLOW_AREA_FRAC = 0.12     # minimum yellow fraction in expanded roi
+SIGN_FY_APPROX        = 730      # approx. vertical focal length at 720p (px)
+SIGN_HEIGHT_M         = 0.65     # assumed sign height (m)
+SIGN_BBOX_MIN_FRAC    = 0.35     # bbox height must be ≥ this fraction of expected px height
 
 # ── UART / low-level controller ────────────────────────────────────────────────
-UART_ENABLED       = True           # set False for vision-only testing (dry run)
-UART_PORT          = "/dev/ttyTHS1" # Jetson hardware UART; change to /dev/ttyUSB0 etc.
+UART_ENABLED       = True
+UART_PORT          = "/dev/ttyTHS1"   # Jetson hardware UART; /dev/ttyUSB0 on PC
 UART_BAUD          = 115200
-UART_TIMEOUT_S     = 0.01           # serial read timeout (s)
-UART_ACK_TIMEOUT_S = 0.05           # how long to wait for MCU echo (s)
-UART_HEARTBEAT_S   = 0.080          # force retransmit every 80ms — keeps Nucleo watchdog
-                                    # alive (200ms timeout) during sustained THROTTLE
+UART_TIMEOUT_S     = 0.01
+UART_ACK_TIMEOUT_S = 0.05
+UART_HEARTBEAT_S   = 0.080   # force retransmit every 80ms — keeps Nucleo watchdog alive
 
 # ── Vehicle commands ────────────────────────────────────────────────────────────
-STOP_BRAKE_DIST_M  = 1.0   # m — stop line/sign must be within this to trigger BRAKE
-THROTTLE_VALUE     = 189   # 0-255 sent with THROTTLE frame
-BRAKE_VALUE        = 255   # 0-255 sent with BRAKE frame
+# The Nucleo runs a PID controller internally.
+# Jetson sends ONLY the setpoints; Nucleo handles throttle, braking, and PWM.
+STOP_BRAKE_DIST_M = 1.0     # stop-line/sign within this distance → send CMD_BRAKE
+BRAKE_VALUE       = 255     # brake intensity byte sent with CMD_BRAKE
 
-# ── Control outputs ────────────────────────────────────────────────────────────
-# Lookahead distance for Pure Pursuit / PID feed-forward (metres)
-CTRL_LOOKAHEAD_M     = 2.5
-# EMA alpha for heading angle smoothing (lower = smoother, higher = responsive)
-CTRL_HEADING_ALPHA   = 0.20
-# EMA alpha for curvature (extra-smooth — small errors get amplified in κ)
-CTRL_CURVATURE_ALPHA = 0.15
-# Image-row fraction used to evaluate heading & curvature (0=top, 1=bottom)
-CTRL_EVAL_Y_FRAC     = 0.60
+# ── Target speed setpoints ────────────────────────────────────────────────────
+# Sent as CMD_THROTTLE DATA byte = int(kmh * 10)  →  e.g. 150 = 15.0 km/h
+SPEED_TARGET_STRAIGHT_KMH = 15.0   # nominal speed on straight sections
+SPEED_TARGET_CURVE_KMH    = 10.0   # reduced speed through corners
+SPEED_CURVE_THRESH        = 0.15   # |κ| (m⁻¹) above which we slow to curve speed
+
+# ── Lane-following control (Pure Pursuit) ─────────────────────────────────────
+CTRL_LOOKAHEAD_M     = 2.5   # lookahead distance for Pure Pursuit (metres)
+CTRL_HEADING_ALPHA   = 0.20  # EMA alpha for heading angle  (lower = smoother)
+CTRL_CURVATURE_ALPHA = 0.15  # EMA alpha for curvature      (extra-smooth)
+CTRL_EVAL_Y_FRAC     = 0.60  # image-row fraction to evaluate heading/curvature
+
+# ── Steering output (anti-jitter stack) ───────────────────────────────────────
+# Data flow every frame:
+#   Pure Pursuit → clamp → dead-band → rate-limit → EMA → UART byte (0-255)
+#
+# 0   = full left  (-STEER_MAX_DEG)
+# 127 = straight   (0°)
+# 255 = full right (+STEER_MAX_DEG)
+STEER_MAX_DEG      = 25.0   # ±25° — hardware limit (right mechanically restricted)
+STEER_DEADBAND_DEG = 2.0    # ignore corrections smaller than this (mask noise)
+STEER_RATE_DEG     = 8.0    # max change per frame  (prevents sudden swerves)
+STEER_EMA_ALPHA    = 0.40   # EMA weight (higher = faster response, more jitter)
 
 # ── Display ────────────────────────────────────────────────────────────────────
 DISPLAY = True
 
 # ── Profiling ──────────────────────────────────────────────────────────────────
-# Prints per-step timing table every 30 frames to identify bottlenecks.
 PROFILE_ENABLED      = True
-PROFILE_PRINT_EVERY  = 30   # frames
+PROFILE_PRINT_EVERY  = 30   # frames between profile dumps
 
-# ── CLAHE — lighting normalisation applied before all colour thresholds ─────────
-# Equalises the L channel (LAB space) so that auto-exposure shifts, shadows,
-# and overcast vs. direct-sun conditions don't collapse fixed HSV/HLS gates.
+# ── CLAHE — lighting normalisation applied before colour thresholds ────────────
 CLAHE_CLIP_LIMIT  = 2.0
-CLAHE_TILE_SIZE   = (8, 8)    # (width, height) grid in tiles
-
-# ── ZED IMU tilt compensation ──────────────────────────────────────────────────
-# When the vehicle pitches or rolls, the fixed BEV homography becomes incorrect.
-# IMU data shifts the bottom warp source points to compensate.
-# Tune PITCH_BASELINE_DEG after mounting the camera in its final position.
-PITCH_BASELINE_DEG = 0.0      # camera pitch (deg) recorded during BEV calibration
-PITCH_PX_PER_DEG   = 8.0      # BEV source shift (px) per degree of pitch — tune on vehicle
-ROLL_PX_PER_DEG    = 3.0      # smaller lateral effect — tune on vehicle
-
-# ── Stop line — physical stripe-width gate ─────────────────────────────────────
-# SEM stop line spans full track width (≥ 2 m).
-# Reject orange detections that are narrower than this fraction of lane width —
-# eliminates orange cones, narrow debris, partial shadows.
-STOP_WIDTH_MIN_FRAC = 0.70    # stripe must be ≥ 70% of measured lane width
-
-# ── Stop sign — SEM-specific hardening ────────────────────────────────────────
-# The SEM stop sign is a red hexagon on a YELLOW BOARD.
-# A secondary yellow-HSV gate around the YOLO bbox rejects generic red objects.
-SIGN_YELLOW_H_MIN    = 18     # HSV hue range for SEM yellow board
-SIGN_YELLOW_H_MAX    = 38
-SIGN_YELLOW_S_MIN    = 120    # vivid yellow only — rejects faded paint
-SIGN_YELLOW_V_MIN    = 150
-SIGN_YELLOW_ROI_FRAC = 1.3    # expand bbox by this factor when sampling for yellow
-SIGN_YELLOW_AREA_FRAC = 0.12  # minimum yellow fraction in expanded roi
-# Bbox height sanity check: at distance d, sign should subtend ~(H_m/d)*fy pixels
-SIGN_FY_APPROX       = 730    # approx. vertical focal length at 720p (px)
-SIGN_HEIGHT_M        = 0.65   # assumed sign height (m) — midpoint of 0.5–1.0m spec
-SIGN_BBOX_MIN_FRAC   = 0.35   # bbox height must be ≥ this fraction of expected px height
-
+CLAHE_TILE_SIZE   = (8, 8)
 
 # ── Depth / point-cloud refresh ───────────────────────────────────────────────
 # Retrieve full XYZ point cloud at most every N frames.
-# Will refresh earlier if any detection vote gate is active.
-# Higher = faster pipeline, slightly stale distances between refreshes.
+# At 15 km/h the car moves ~0.14 m per frame — stale ≤4 frames = ≤0.56 m,
+# acceptable for vote-gated stop decisions.
 PC_REFRESH_EVERY   = 4
 
 # ── FPS monitoring ─────────────────────────────────────────────────────────────
-FPS_WARN_BELOW     = 20.0     # print warning if rolling average FPS drops below this
+FPS_WARN_BELOW     = 20.0
 
 # ── Telemetry logging ──────────────────────────────────────────────────────────
 LOG_TELEMETRY      = True
 LOG_DIR            = "logs"
+
+# ── Adaptive Segformer submission rate ────────────────────────────────────────
+# On straights the road mask barely changes frame-to-frame, so we only submit
+# a new frame every SEG_SKIP_STRAIGHT frames — the EMA polynomial carries between
+# submissions without noticeable error.
+# On curves we submit every SEG_SKIP_CURVE frames for maximum steering freshness.
+# Detection of straight vs. curve uses the smoothed curvature from the last result.
+# (This reduces GPU usage and power draw on straights — critical for eco-marathon.)
+SEG_SKIP_STRAIGHT = 5   # submit 1 in every 5 frames on straights (~6 Hz at 30fps)
+SEG_SKIP_CURVE    = 1   # submit every frame on curves (full inference rate)
+
+# ── Segformer drivable-area lane detection ─────────────────────────────────────
+# Replaces RANSAC + colour-threshold lane fitting.
+# Works without white lane markings — detects asphalt / grass boundaries.
+SEG_MODEL_ID       = "nvidia/segformer-b2-finetuned-cityscapes-1024-1024"
+SEG_ROAD_CLASSES   = [0]        # Cityscapes class 0 = road (drivable asphalt)
+SEG_ROI_TOP_FRAC   = 0.35       # ignore top fraction of frame (sky / hood)
+SEG_MIN_ROAD_FRAC  = 0.02       # min road fraction per row to count as valid boundary
+SEG_BOUNDARY_ROWS  = 30         # rows scanned top→bottom for left/right boundary
+SEG_POLY_DEG       = 2          # quadratic fit  x = a·y² + b·y + c
+SEG_CONF_THRESHOLD = 0.35       # min valid-row fraction to accept fresh fit vs hold EMA
+SEG_NEAR_FRAC      = 0.85       # image-row fraction for near point (lateral deviation)
+SEG_FAR_FRAC       = 0.55       # image-row fraction for far  point (heading angle)
