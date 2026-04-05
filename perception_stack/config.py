@@ -102,7 +102,7 @@ STEER_MAX_DEG         = 25.0  # ±25° — hardware limit (right mechanically re
 STEER_DEADBAND_DEG    = 2.0   # ignore corrections smaller than this (mask noise)
 STEER_RATE_DEG        = 5.0   # max change per frame  (prevents sudden swerves)
 STEER_EMA_ALPHA       = 0.25  # EMA weight — lower = smoother/slower response
-STEER_TX_DEADBAND_DEG = 3.0   # only transmit CMD_STEER if angle changed by more than
+STEER_TX_DEADBAND_DEG = 5.0   # only transmit CMD_STEER if angle changed by more than
                                # this from the last SENT value.  Suppresses rapid
                                # micro-corrections from mask noise reaching the motor.
 
