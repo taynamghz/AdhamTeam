@@ -22,9 +22,9 @@ from perception_stack.config import (
     CAM_RES, CAM_FPS, CAM_DEPTH_MODE,
     ROI_TOP_FRACTION,
     STOP_VOTE_NEEDED,
-    CTRL_EVAL_Y_FRAC,
     SPEED_CURVE_THRESH,
     SEG_SKIP_STRAIGHT, SEG_SKIP_CURVE,
+    SEG_FIT_TOP_FRAC, SEG_NEAR_FRAC,
     PROFILE_ENABLED, PROFILE_PRINT_EVERY,
     CLAHE_CLIP_LIMIT, CLAHE_TILE_SIZE,
     FPS_WARN_BELOW,
@@ -267,10 +267,16 @@ class LanePerception:
             out_dist = self._last_stop_dist if stop_confirmed else 0.0
 
             # ── Heading, curvature, lookahead ─────────────────────────────────
-            y_ctrl = int(self.H * CTRL_EVAL_Y_FRAC)
+            # Evaluate at the top of the fitted window (lookahead point), not
+            # CTRL_EVAL_Y_FRAC which falls outside the fitted range.
+            y_ctrl = int(self.H * SEG_FIT_TOP_FRAC)
+            # wid_px from road mask directly — lf==rf==centerline so diff is 0
             wid_px = 0.0
-            if lf is not None and rf is not None:
-                wid_px = abs(eval_x(rf, y_ctrl) - eval_x(lf, y_ctrl))
+            if fm is not None:
+                y_wid = int(self.H * SEG_NEAR_FRAC)
+                cols  = np.where(fm[y_wid] > 0)[0]
+                if len(cols) >= 2:
+                    wid_px = float(cols[-1] - cols[0])
             have_valid_lane = (lf is not None or rf is not None) and wid > 0.0
             if have_valid_lane:
                 heading_raw = compute_heading(lf, rf, y_ctrl)

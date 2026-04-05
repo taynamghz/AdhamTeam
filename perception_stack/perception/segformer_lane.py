@@ -7,10 +7,15 @@ Works without white lane markings — detects asphalt/grass boundaries directly.
 
 Pipeline per frame:
   1. Run Segformer (Cityscapes) → road mask (H×W bool)
-  2. Scan SEG_BOUNDARY_ROWS evenly-spaced rows → leftmost/rightmost road pixel
-  3. Polyfit degree-2: x = f(y) for each boundary
-  4. Convert px offset to metres using ZED point-cloud depth at eval row
-  5. Return (lf, rf, road_mask, dev_m, wid_m, lc, rc, source)
+  2. Scan SEG_BOUNDARY_ROWS evenly-spaced rows in the lookahead window
+     → at each row: road_center_x = (leftmost_road_px + rightmost_road_px) / 2
+  3. Polyfit degree-2: x = f(y) to those center points → centerline polynomial
+  4. Evaluate centerline at y_near for lateral deviation
+  5. Convert px offset to metres using ZED point-cloud depth at eval row
+  6. Return (cf, cf, road_mask, dev_m, wid_m, conf, conf, source)
+     cf is the centerline polynomial — passed as both lf and rf so that
+     downstream compute_heading / compute_curvature (which average lf+rf)
+     receive the correct centerline without modification.
 
 Threading model
 ───────────────
@@ -22,9 +27,6 @@ is never blocked.  The main thread calls:
 
 The result is 1 camera-frame stale on average (≈33 ms at 30 fps, ≈14 cm at 15 km/h).
 That latency is negligible for lane-following at the speeds used in SEM.
-
-On Jetson CUDA without TRT: ~15-20 ms per inference → main thread never waits.
-With TensorRT FP16 export:  ~8-10 ms per inference.
 """
 
 import queue
@@ -44,6 +46,8 @@ from perception_stack.config import (
     SEG_CONF_THRESHOLD,
     SEG_NEAR_FRAC,
     SEG_FAR_FRAC,
+    SEG_FIT_TOP_FRAC,
+    SEG_CENTERLINE_ALPHA,
 )
 
 
@@ -61,14 +65,17 @@ _NULL_RESULT = (None, None,
 
 class SegformerLane:
     """
-    Wraps Segformer-B2 (Cityscapes) for drivable-area boundary detection.
+    Wraps Segformer-B2 (Cityscapes) for drivable-area centerline detection.
+
+    Deviation and curvature are computed from the road mask directly:
+    scan the road-pixel center per row → fit a quadratic centerline.
+    No left/right boundary polynomial fitting — avoids polynomial explosion
+    when the road mask is wide or noisy.
 
     Public async interface (used by pipeline.py):
         init()         — load model, start worker thread
         submit(...)    — non-blocking: post latest frame to worker
         get_result()   — non-blocking: read latest computed result
-
-    The synchronous _infer() method is only called from the worker thread.
     """
 
     def __init__(self):
@@ -76,10 +83,11 @@ class SegformerLane:
         self._processor  = None
         self._device     = _best_device()
 
-        # EMA state on polynomial coefficients (lives in worker thread — no lock needed)
-        self._smoother_l = None
-        self._smoother_r = None
-        self._alpha      = 0.30
+        # EMA on polynomial coefficients (worker thread only — no lock)
+        self._smoother_cf = None   # centerline  → deviation
+        self._smoother_l  = None   # left boundary  → heading/curvature
+        self._smoother_r  = None   # right boundary → heading/curvature
+        self._alpha       = SEG_CENTERLINE_ALPHA
 
         # Async infrastructure
         self._queue:  queue.Queue = queue.Queue(maxsize=1)
@@ -102,7 +110,6 @@ class SegformerLane:
             print(f"[SegformerLane] init failed: {e}")
             return False
 
-        # Start background inference thread
         self._thread = threading.Thread(target=self._worker, daemon=True, name="SegformerWorker")
         self._thread.start()
         return True
@@ -111,15 +118,10 @@ class SegformerLane:
 
     def submit(self, frame_bgr: np.ndarray, pc: np.ndarray,
                H: int, W: int, fx: float) -> None:
-        """
-        Post the latest frame to the worker.  Non-blocking.
-        If the worker hasn't consumed the previous frame yet, that stale
-        frame is silently replaced — the worker always processes the newest.
-        """
+        """Non-blocking: post latest frame to worker, dropping stale frames."""
         try:
             self._queue.put_nowait((frame_bgr, pc, H, W, fx))
         except queue.Full:
-            # Replace stale queued item with newest frame
             try:
                 self._queue.get_nowait()
             except queue.Empty:
@@ -133,6 +135,7 @@ class SegformerLane:
         """
         Non-blocking read of the latest computed result.
         Returns (lf, rf, road_mask, dev_m, wid_m, lc, rc, source).
+        lf == rf == centerline polynomial (so downstream heading/curvature work unchanged).
         road_mask is None until the first inference completes.
         """
         with self._lock:
@@ -142,7 +145,7 @@ class SegformerLane:
 
     def _worker(self) -> None:
         while True:
-            frame_bgr, pc, H, W, fx = self._queue.get()   # blocks until submitted
+            frame_bgr, pc, H, W, fx = self._queue.get()
             result = self._infer(frame_bgr, pc, H, W, fx)
             with self._lock:
                 self._result = result
@@ -164,39 +167,66 @@ class SegformerLane:
             mask |= (pred == cls)
         return mask
 
-    # ── Boundary extraction ────────────────────────────────────────────────────
+    # ── Dual-zone centerline scan ─────────────────────────────────────────────
+    #
+    # Zone 1 — near  [fit_top, H]:   centerline → dev_m        (precise, stable)
+    # Zone 2 — full  [roi_top, H]:   centerline → heading/curv (sees full curve)
+    #
+    # We use the CENTRE (left+right)/2 per row for both zones — not the raw
+    # boundary.  The centre averages out left/right noise, so it is reliable
+    # even in far rows where individual boundary pixels are noisy.  Boundary-
+    # only polynomials in far rows blow up because a single misclassified pixel
+    # on one side shifts that edge wildly; the centre is immune to that.
 
     @staticmethod
-    def _extract_boundary_pts(mask: np.ndarray, roi_top: int):
-        h, w   = mask.shape
-        rows   = np.linspace(roi_top, h - 1, SEG_BOUNDARY_ROWS, dtype=int)
-        left_pts, right_pts = [], []
-        for r in rows:
+    def _scan_roads(mask: np.ndarray, roi_top: int, fit_top: int, y_near: int):
+        """
+        Scan road-centre x at two row densities.
+
+        near_pts : centre in [fit_top, H]  → deviation polynomial
+        full_pts : centre in [roi_top, H]  → heading/curvature polynomial
+                   (denser scan so far rows contribute meaningfully)
+
+        Returns
+        -------
+        near_pts    : (N,2) float (y, cx) or None
+        full_pts    : (M,2) float (y, cx) or None
+        wid_px_near : float  road width in px at y_near
+        """
+        h, w      = mask.shape
+        near_rows = np.linspace(fit_top,  h - 1, SEG_BOUNDARY_ROWS,      dtype=int)
+        full_rows = np.linspace(roi_top,  h - 1, SEG_BOUNDARY_ROWS * 2,  dtype=int)
+
+        near_pts    = []
+        full_pts    = []
+        wid_px_near = 0.0
+        best_dist   = h
+
+        for r in near_rows:
             cols = np.where(mask[r])[0]
             if len(cols) < int(w * SEG_MIN_ROAD_FRAC):
                 continue
-            left_pts.append((cols.min(), r))
-            right_pts.append((cols.max(), r))
-        return (np.array(left_pts)  if len(left_pts)  >= 3 else None,
-                np.array(right_pts) if len(right_pts) >= 3 else None)
+            lx = float(cols.min())
+            rx = float(cols.max())
+            cx = (lx + rx) / 2.0
+            near_pts.append((float(r), cx))
+            dist = abs(int(r) - y_near)
+            if dist < best_dist:
+                best_dist   = dist
+                wid_px_near = rx - lx
 
-    # ── Polynomial fit + EMA ──────────────────────────────────────────────────
+        for r in full_rows:
+            cols = np.where(mask[r])[0]
+            if len(cols) < int(w * SEG_MIN_ROAD_FRAC):
+                continue
+            cx = (float(cols.min()) + float(cols.max())) / 2.0
+            full_pts.append((float(r), cx))
 
-    @staticmethod
-    def _fit(pts: np.ndarray):
-        if pts is None or len(pts) < 3:
-            return None
-        return np.polyfit(pts[:, 1], pts[:, 0], deg=SEG_POLY_DEG)
-
-    def _smooth(self, new_l, new_r):
-        a = self._alpha
-        if new_l is not None:
-            self._smoother_l = (new_l if self._smoother_l is None
-                                else a * new_l + (1 - a) * self._smoother_l)
-        if new_r is not None:
-            self._smoother_r = (new_r if self._smoother_r is None
-                                else a * new_r + (1 - a) * self._smoother_r)
-        return self._smoother_l, self._smoother_r
+        return (
+            np.array(near_pts, dtype=float) if len(near_pts) >= 3 else None,
+            np.array(full_pts, dtype=float) if len(full_pts) >= 3 else None,
+            wid_px_near,
+        )
 
     # ── Pixel → metres using ZED point cloud ──────────────────────────────────
 
@@ -220,42 +250,72 @@ class SegformerLane:
                H: int, W: int, fx: float):
         """
         Run one frame of Segformer lane detection.
+
         Returns (lf, rf, road_mask, dev_m, wid_m, lc, rc, source).
+
+        dev_m  — from near-zone centerline (most stable)
+        lf, rf — boundary polynomials from full ROI (prominent side only)
+                 used by compute_heading / compute_curvature downstream
         """
-        roi_top = int(H * SEG_ROI_TOP_FRAC)
-        y_near  = int(H * SEG_NEAR_FRAC)
+        roi_top  = int(H * SEG_ROI_TOP_FRAC)
+        fit_top  = int(H * SEG_FIT_TOP_FRAC)
+        y_near   = int(H * SEG_NEAR_FRAC)
+        cx_frame = W / 2.0
 
         road_mask = self._road_mask(frame_bgr)
 
-        left_pts, right_pts = self._extract_boundary_pts(road_mask, roi_top)
-        raw_l = self._fit(left_pts)
-        raw_r = self._fit(right_pts)
-        lf, rf = self._smooth(raw_l, raw_r)
+        near_pts, full_pts, wid_px_near = self._scan_roads(
+            road_mask, roi_top, fit_top, y_near)
 
-        max_rows = SEG_BOUNDARY_ROWS
-        lc = (len(left_pts)  / max_rows if left_pts  is not None else 0.0)
-        rc = (len(right_pts) / max_rows if right_pts is not None else 0.0)
+        # ── Near-zone centerline → deviation ─────────────────────────────────
+        cf_near_raw = None
+        conf        = 0.0
+        if near_pts is not None:
+            cf_near_raw = np.polyfit(near_pts[:, 0], near_pts[:, 1], deg=SEG_POLY_DEG)
+            x_test = float(np.polyval(cf_near_raw, y_near))
+            if not (0 <= x_test <= W):
+                cf_near_raw = None
+            else:
+                conf = len(near_pts) / SEG_BOUNDARY_ROWS
 
-        if lc < SEG_CONF_THRESHOLD: lf = self._smoother_l
-        if rc < SEG_CONF_THRESHOLD: rf = self._smoother_r
+        if cf_near_raw is not None:
+            self._smoother_cf = (cf_near_raw if self._smoother_cf is None
+                                 else self._alpha * cf_near_raw + (1 - self._alpha) * self._smoother_cf)
+        cf_near = self._smoother_cf
 
         dev_m = wid_m = 0.0
-        if lf is not None and rf is not None:
-            lx = float(np.polyval(lf, y_near))
-            rx = float(np.polyval(rf, y_near))
-            cx_road  = (lx + rx) / 2.0
-            cx_frame = W / 2.0
-            # Positive deviation = lane centre RIGHT of frame centre = car drifted LEFT → steer right
-            dev_px   = cx_road - cx_frame
-            wid_px   = max(rx - lx, 1.0)
-            cx_col   = int(np.clip(cx_road, 0, W - 1))
-            dev_m  = self._px_to_m(dev_px, y_near, cx_col, pc, fx)
-            wid_m  = self._px_to_m(wid_px, y_near, cx_col, pc, fx)
+        if cf_near is not None:
+            cx_road = float(np.clip(np.polyval(cf_near, y_near), 0, W - 1))
+            dev_px  = cx_road - cx_frame
+            cx_col  = int(np.clip(cx_road, 0, W - 1))
+            dev_m   = self._px_to_m(dev_px,      y_near, cx_col, pc, fx)
+            wid_m   = self._px_to_m(wid_px_near, y_near, cx_col, pc, fx)
 
-        if lf is not None and rf is not None:
+        # ── Full-range centerline → heading / curvature ───────────────────────
+        # Fitted over [roi_top, H] so far rows contribute their heading signal.
+        # Using the centre (not boundary) means far-row noise averages out —
+        # a misclassified pixel on one side is balanced by the opposite side.
+        cf_full_raw = None
+        if full_pts is not None:
+            cf_full_raw = np.polyfit(full_pts[:, 0], full_pts[:, 1], deg=SEG_POLY_DEG)
+            x_test = float(np.polyval(cf_full_raw, y_near))
+            if not (0 <= x_test <= W):
+                cf_full_raw = None
+
+        if cf_full_raw is not None:
+            self._smoother_l = (cf_full_raw if self._smoother_l is None
+                                else self._alpha * cf_full_raw + (1 - self._alpha) * self._smoother_l)
+        cf_full = self._smoother_l
+
+        # lf = rf = full-range poly so compute_heading/curvature get the curve signal
+        # while dev_m stays anchored to the stable near-zone measurement
+        lf = cf_full
+        rf = cf_full
+
+        lc = rc = conf
+
+        if cf_near is not None:
             source = "SEGFORMER"
-        elif lf is not None or rf is not None:
-            source = "SEG_PARTIAL"
         else:
             source = "LOST"
 

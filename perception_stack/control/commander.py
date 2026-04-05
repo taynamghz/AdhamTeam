@@ -8,22 +8,28 @@ The Nucleo LLC runs PID control internally.  The Jetson sends only setpoints:
   CMD_BRAKE     DATA = brake intensity (emergency stop at stop-line / stop-sign)
   CMD_STEER     DATA = steering angle byte (0=full-left, 127=centre, 255=full-right)
 
-Every frame Commander:
-  1. Decides BRAKE or RUN based on stop triggers
-  2. Selects target speed  (straight=15 km/h, curve=10 km/h)
-  3. Computes steering angle via Pure Pursuit + anti-jitter stack
-  4. Sends all three setpoints to Nucleo via UART
+Command update trigger — lookahead-distance gating:
+  Steer + throttle are only sent when the car has physically traveled one
+  CTRL_LOOKAHEAD_M since the last transmission.  Distance is integrated from
+  the actual speed reported by the Nucleo UART telemetry.
 
-Speed feedback (current speed) is read from the Nucleo's telemetry packets
-by the UARTController background reader thread (uart.speed_kmh).
+  Why: Pure Pursuit computes a target point CTRL_LOOKAHEAD_M ahead.  Sending
+  a new command before the car reaches that point just fights the motor PID
+  mid-move.  Waiting one lookahead distance lets each command fully execute
+  before the next correction is issued.
 
-Anti-jitter stack for steering:
-  clamp ±STEER_MAX_DEG → dead-band STEER_DEADBAND_DEG → rate-limit STEER_RATE_DEG/frame
-  → EMA STEER_EMA_ALPHA → encode to 0-255 byte → CMD_STEER
+  Natural rate:
+    15 km/h, L=2.5 m → sends every ~0.6 s  (~1.7 Hz)
+    10 km/h, L=2.5 m → sends every ~0.9 s  (~1.1 Hz)
+
+  Fallback: if speed = 0 (car stopped / UART not yet connected), falls back
+  to a fixed interval = CTRL_LOOKAHEAD_M / SPEED_TARGET_STRAIGHT_KMH so the
+  system doesn't freeze waiting for movement that hasn't started.
+
+  Brake commands are always sent immediately, every frame — never gated.
 """
 
 import math
-import time
 import logging
 
 from perception_stack.config import (
@@ -32,7 +38,7 @@ from perception_stack.config import (
     SPEED_TARGET_STRAIGHT_KMH, SPEED_TARGET_CURVE_KMH, SPEED_CURVE_THRESH,
     CTRL_LOOKAHEAD_M,
     STEER_MAX_DEG, STEER_DEADBAND_DEG, STEER_RATE_DEG, STEER_EMA_ALPHA,
-    STEER_SEND_INTERVAL_S,
+    STEER_TX_DEADBAND_DEG,
 )
 from perception_stack.models import PerceptionResult
 from perception_stack.control.uart import UARTController
@@ -62,10 +68,10 @@ class Commander:
     def __init__(self):
         self.uart = UARTController()
 
-        self._state:        str   = "RUN"
-        self._last_steer:   float = 0.0
-        self._steer_ema:    float = 0.0
-        self._last_steer_t: float = 0.0   # time of last CMD_STEER transmission
+        self._state:          str   = "RUN"
+        self._last_steer:     float = 0.0
+        self._steer_ema:      float = 0.0
+        self._last_sent_deg:  float = 0.0   # last angle actually transmitted to Nucleo
 
         # Public state (for display / telemetry)
         self.target_kmh: float = SPEED_TARGET_STRAIGHT_KMH
@@ -110,14 +116,15 @@ class Commander:
         if UART_ENABLED:
             if brake:
                 self.uart.brake(BRAKE_VALUE)
+                self._last_sent_deg = 0.0   # reset so next RUN sends immediately
             else:
                 self.uart.set_speed(target)
-            # Rate-limit STEER: Nucleo motor PID needs time to settle each move.
-            # Only transmit if STEER_SEND_INTERVAL_S has elapsed since last send.
-            now = time.time()
-            if now - self._last_steer_t >= STEER_SEND_INTERVAL_S:
-                self.uart.steer(_deg_to_steer_byte(steer))
-                self._last_steer_t = now
+                # TX dead-band: only send CMD_STEER when the angle has changed
+                # meaningfully from the last transmitted value.  Suppresses rapid
+                # micro-corrections from mask noise — motor only moves for real changes.
+                if abs(steer - self._last_sent_deg) >= STEER_TX_DEADBAND_DEG:
+                    self.uart.steer(_deg_to_steer_byte(steer))
+                    self._last_sent_deg = steer
 
         if state != self._state:
             log.info("[Commander] %s → %s  src=%s  spd=%.1f km/h  steer=%.1f deg",
