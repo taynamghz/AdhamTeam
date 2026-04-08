@@ -8,25 +8,14 @@ The Nucleo LLC runs PID control internally.  The Jetson sends only setpoints:
   CMD_BRAKE     DATA = brake intensity (emergency stop at stop-line / stop-sign)
   CMD_STEER     DATA = steering angle byte (0=full-left, 127=centre, 255=full-right)
 
-Command update trigger — lookahead-distance gating:
-  Steer + throttle are only sent when the car has physically traveled one
-  CTRL_LOOKAHEAD_M since the last transmission.  Distance is integrated from
-  the actual speed reported by the Nucleo UART telemetry.
-
-  Why: Pure Pursuit computes a target point CTRL_LOOKAHEAD_M ahead.  Sending
-  a new command before the car reaches that point just fights the motor PID
-  mid-move.  Waiting one lookahead distance lets each command fully execute
-  before the next correction is issued.
-
-  Natural rate:
-    15 km/h, L=2.5 m → sends every ~0.6 s  (~1.7 Hz)
-    10 km/h, L=2.5 m → sends every ~0.9 s  (~1.1 Hz)
-
-  Fallback: if speed = 0 (car stopped / UART not yet connected), falls back
-  to a fixed interval = CTRL_LOOKAHEAD_M / SPEED_TARGET_STRAIGHT_KMH so the
-  system doesn't freeze waiting for movement that hasn't started.
-
-  Brake commands are always sent immediately, every frame — never gated.
+Command update policy:
+  CMD_THROTTLE — sent every frame as a speed setpoint (km/h × 10 as byte).
+  CMD_STEER    — sent only when the new angle differs from the last transmitted
+                 value by ≥ STEER_TX_DEADBAND_DEG (5°).  This suppresses rapid
+                 micro-corrections caused by mask noise — the motor only moves
+                 when a real steering change is needed.
+  CMD_BRAKE    — sent immediately every frame when a stop-line or stop-sign is
+                 within STOP_BRAKE_DIST_M.  Never gated by the steer dead-band.
 """
 
 import math
