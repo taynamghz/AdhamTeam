@@ -31,7 +31,8 @@ import time
 import serial
 
 from perception_stack.config import (
-    UART_PORT, UART_BAUD, UART_TIMEOUT_S, UART_ACK_TIMEOUT_S, UART_HEARTBEAT_S,
+    UART_PORT, UART_BAUD, UART_TIMEOUT_S, UART_ACK_TIMEOUT_S,
+    UART_HEARTBEAT_S, UART_WATCHDOG_ENABLED,
 )
 
 log = logging.getLogger(__name__)
@@ -153,7 +154,8 @@ class UARTController:
             return False
 
         now = time.time()
-        heartbeat_due = (now - self._last_sent) >= UART_HEARTBEAT_S
+        heartbeat_due = (UART_WATCHDOG_ENABLED and
+                         (now - self._last_sent) >= UART_HEARTBEAT_S)
         if cmd == self._last_cmd and value == self._last_val and not heartbeat_due:
             return True
 

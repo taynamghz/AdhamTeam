@@ -72,6 +72,7 @@ UART_BAUD          = 115200
 UART_TIMEOUT_S     = 0.01
 UART_ACK_TIMEOUT_S = 0.05
 UART_HEARTBEAT_S   = 0.080   # force retransmit every 80ms — keeps Nucleo watchdog alive
+UART_WATCHDOG_ENABLED = False  # Set True when Nucleo watchdog is active (production)
 
 # ── Vehicle commands ────────────────────────────────────────────────────────────
 # The Nucleo runs a PID controller internally.
