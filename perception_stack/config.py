@@ -91,6 +91,13 @@ CTRL_HEADING_ALPHA   = 0.20  # EMA alpha for heading angle  (lower = smoother)
 CTRL_CURVATURE_ALPHA = 0.15  # EMA alpha for curvature      (extra-smooth)
 CTRL_EVAL_Y_FRAC     = 0.60  # image-row fraction to evaluate heading/curvature
 
+# Lateral tolerance corridor — only apply lateral correction when the car drifts
+# beyond this distance from the lane centre.  Inside the band, deviation is zeroed
+# and the car is steered purely by road heading (curvature feed-forward).
+# Goal: stay on track and take curves safely, not chase the exact centreline.
+# With a ~3 m lane, ±0.40 m keeps the car in the middle 73 % of the lane width.
+CTRL_LATERAL_DEADBAND_M = 0.40
+
 # ── Steering output (anti-jitter stack) ───────────────────────────────────────
 # Data flow every frame:
 #   Pure Pursuit → clamp → dead-band → rate-limit → EMA → UART byte (0-255)

@@ -25,7 +25,7 @@ from perception_stack.config import (
     UART_ENABLED,
     STOP_BRAKE_DIST_M, BRAKE_VALUE,
     SPEED_TARGET_STRAIGHT_KMH, SPEED_TARGET_CURVE_KMH, SPEED_CURVE_THRESH,
-    CTRL_LOOKAHEAD_M,
+    CTRL_LOOKAHEAD_M, CTRL_LATERAL_DEADBAND_M,
     STEER_MAX_DEG, STEER_DEADBAND_DEG, STEER_RATE_DEG, STEER_EMA_ALPHA,
     STEER_TX_DEADBAND_DEG,
 )
@@ -165,8 +165,15 @@ class Commander:
             self._last_steer  = self._steer_ema
             return self._steer_ema
 
+        # Lateral tolerance corridor — zero out small deviations so the car
+        # steers through curves on heading alone, without chasing the centreline.
+        # Only correct laterally when genuinely drifting toward an edge.
+        dev = result.deviation_m
+        if abs(dev) < CTRL_LATERAL_DEADBAND_M:
+            dev = 0.0
+
         # Pure Pursuit lateral correction + road-heading feed-forward
-        raw_rad = (math.atan(result.deviation_m / max(CTRL_LOOKAHEAD_M, 0.1))
+        raw_rad = (math.atan(dev / max(CTRL_LOOKAHEAD_M, 0.1))
                    - result.heading_angle)
         raw_deg = math.degrees(raw_rad)
 
